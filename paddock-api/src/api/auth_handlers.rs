@@ -36,10 +36,21 @@ pub async fn register_request(
     if user_exists(&state.pool, &req.username).await? {
         return Err(ApiError::conflict("用户名已存在（不允许重复注册）"));
     }
+    // 同名在途会话检查：pending 里锁存了 username，防止同名并发注册
+    let pending_same_name: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM pending_regs WHERE username = $1 AND expires_at > now()",
+    )
+    .bind(&req.username)
+    .fetch_one(&state.pool)
+    .await?;
+    if pending_same_name > 0 {
+        return Err(ApiError::conflict("该用户名已有注册申请在途，请等待其完成或过期后再试"));
+    }
     let reg_code = auth::gen_reg_code();
     let expires = Utc::now() + Duration::minutes(auth::REG_CODE_TTL_MINUTES);
-    sqlx::query("INSERT INTO pending_regs (reg_code, expires_at) VALUES ($1, $2)")
+    sqlx::query("INSERT INTO pending_regs (reg_code, username, expires_at) VALUES ($1, $2, $3)")
         .bind(&reg_code)
+        .bind(&req.username)
         .bind(expires)
         .execute(&state.pool)
         .await?;
@@ -65,15 +76,19 @@ pub async fn register_verify(
     auth::validate_password(&req.password).map_err(ApiError::bad_request)?;
 
     let mut tx = state.pool.begin().await?;
-    let row: Option<(Option<String>, String)> = sqlx::query_as(
-        "DELETE FROM pending_regs WHERE reg_code = $1 AND expires_at > now() RETURNING member_openid, status",
+    let row: Option<(Option<String>, String, String)> = sqlx::query_as(
+        "DELETE FROM pending_regs WHERE reg_code = $1 AND expires_at > now() RETURNING member_openid, status, username",
     )
     .bind(&req.reg_code)
     .fetch_optional(&mut *tx)
     .await?;
-    let Some((member_openid, status)) = row else {
+    let Some((member_openid, status, locked_username)) = row else {
         return Err(ApiError::not_found("校验码无效或已过期，请重新申请"));
     };
+    // username 必须与申请时锁存的一致（防拿别人的码换名建号）
+    if req.username != locked_username {
+        return Err(ApiError::bad_request("用户名与申请时不一致，请使用申请时的用户名"));
+    }
     if status != "verified" || member_openid.is_none() {
         return Err(ApiError::bad_request(
             "该码尚未在 CAMDA 群完成校验，请先在群内发送校验消息",

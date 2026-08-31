@@ -51,7 +51,7 @@ pub async fn points_board(
                             count(*) OVER (PARTITION BY gp_index) AS n_in_track
                      FROM best_laps WHERE version_code = $1
                    )
-                   SELECT u.id AS user_id, u.username AS username,
+                   SELECT u.id AS user_id, u.username AS username, NULL::text AS avatar_url,
                           (CASE WHEN n_in_track = 1 THEN 100
                                 ELSE round(1 + (n_in_track - rank_in_track)::numeric * 99 / (n_in_track - 1))
                            END)::bigint AS points
@@ -86,7 +86,7 @@ pub async fn points_board(
                             count(*) OVER (PARTITION BY gp_index) AS n_in_track
                      FROM user_best
                    )
-                   SELECT u.id AS user_id, u.username AS username,
+                   SELECT u.id AS user_id, u.username AS username, NULL::text AS avatar_url,
                           (CASE WHEN n_in_track = 1 THEN 100
                                 ELSE round(1 + (n_in_track - rank_in_track)::numeric * 99 / (n_in_track - 1))
                            END)::bigint AS points

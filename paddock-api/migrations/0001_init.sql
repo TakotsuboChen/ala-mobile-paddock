@@ -19,13 +19,16 @@ CREATE INDEX idx_sessions_user ON sessions(user_id);
 
 -- pending_regs: 注册会话。reg_code 绑定会话一次性使用，30 分钟时效。
 -- 流程：模块申请码 → 用户发群里 → bot 用码定位会话并绑定 member_openid → 模块 verify 建号。
+-- username 在申请时即锁存：同名在途会话存在时拒绝再申请（防同名并发注册）。
 CREATE TABLE pending_regs (
     reg_code      TEXT PRIMARY KEY,
+    username      TEXT NOT NULL,
     member_openid TEXT,                 -- bot 校验成功后写入
     status        TEXT NOT NULL DEFAULT 'pending',  -- pending|verified
     expires_at    TIMESTAMPTZ NOT NULL
 );
 CREATE INDEX idx_pending_regs_openid ON pending_regs(member_openid);
+CREATE INDEX idx_pending_regs_username ON pending_regs(username);
 
 -- laps: 全量留档（防伪=全放行的配套：事后审计/删除重算的依据）。
 CREATE TABLE laps (
@@ -50,10 +53,13 @@ CREATE TABLE best_laps (
 CREATE INDEX idx_best_laps_rank ON best_laps(gp_index, version_code, lap_ms);
 
 -- records: 全服最佳（历史 alltime / 版本 version），Toast 判定与登顶提示依据。
+-- ⚠️ 复合主键列隐式 NOT NULL，而 alltime 行 version_code 必须可 NULL——
+-- 因此主键用 version_code 的显式 NULL 处理：alltime 行 version_code 统一存 0 代替 NULL，
+-- kind 列才是真正的区分键（alltime 行读时忽略 version_code）。
 CREATE TABLE records (
     gp_index     SMALLINT NOT NULL,
-    kind         TEXT NOT NULL,         -- alltime|version
-    version_code INTEGER,               -- kind=version 时非 NULL
+    kind         TEXT NOT NULL CHECK (kind IN ('alltime','version')),
+    version_code INTEGER NOT NULL DEFAULT 0,  -- alltime 行恒 0（占位），version 行=游戏 versionCode
     lap_ms       INTEGER NOT NULL,
     user_id      UUID REFERENCES users(id) ON DELETE SET NULL,
     updated_at   TIMESTAMPTZ NOT NULL DEFAULT now(),

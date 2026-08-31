@@ -140,26 +140,32 @@ pub async fn upload_lap(
         Some(ms) => lap.lap_ms < ms,
     };
 
-    if is_alltime_new || is_version_new {
-        server_best = true;
+    // 两个纪录维度独立判定、独立 upsert；Toast 按 alltime_server > version_server 取最高。
+    server_best = is_alltime_new || is_version_new;
+    if server_best {
         let track = track_display_name(lap.gp_index).to_string();
         if is_alltime_new {
-            upsert_record(&mut tx, lap.gp_index, "alltime", None, lap.lap_ms, user_id).await?;
+            // alltime 行 version_code 占位 0（复合主键列不可 NULL，见 migration 注释）
+            upsert_record(&mut tx, lap.gp_index, "alltime", 0, lap.lap_ms, user_id).await?;
+        }
+        if is_version_new {
+            upsert_record(
+                &mut tx,
+                lap.gp_index,
+                "version",
+                lap.version_code,
+                lap.lap_ms,
+                user_id,
+            )
+            .await?;
+        }
+        if is_alltime_new {
             toast = Some(Toast {
                 level: "alltime_server",
                 track,
                 lap_ms: lap.lap_ms,
             });
         } else {
-            upsert_record(
-                &mut tx,
-                lap.gp_index,
-                "version",
-                Some(lap.version_code),
-                lap.lap_ms,
-                user_id,
-            )
-            .await?;
             toast = Some(Toast {
                 level: "version_server",
                 track,
@@ -204,7 +210,7 @@ async fn upsert_record(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     gp_index: i16,
     kind: &str,
-    version_code: Option<i32>,
+    version_code: i32, // alltime 行恒 0 占位
     lap_ms: i32,
     user_id: Uuid,
 ) -> Result<(), ApiError> {
