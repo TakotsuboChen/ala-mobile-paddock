@@ -1,0 +1,61 @@
+# paddock docker-compose 部署（轻量 VPS：2GB RAM 起步）
+# 契约源：../ala-mobile-tool/docs/PADDOCK_PLAN.md
+
+services:
+  app:
+    build: .
+    restart: unless-stopped
+    environment:
+      DATABASE_URL: postgres://paddock:${POSTGRES_PASSWORD}@postgres:5432/paddock
+      BIND_ADDR: 0.0.0.0:8080
+      RUST_LOG: paddock_api=info,tower_http=warn
+    depends_on:
+      postgres:
+        condition: service_healthy
+    expose:
+      - "8080"
+
+  postgres:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: paddock
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: paddock
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U paddock"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  garage:
+    image: dxflrs/garage:v1.1.0
+    restart: unless-stopped
+    volumes:
+      - garage-data:/var/lib/garage/data
+      - garage-meta:/var/lib/garage/meta
+      - ./garage.toml:/etc/garage.toml:ro
+    expose:
+      - "3900"   # S3 API（仅内网，经 app 或 Caddy 访问）
+
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    depends_on:
+      - app
+
+volumes:
+  pgdata:
+  garage-data:
+  garage-meta:
+  caddy-data:
+  caddy-config:

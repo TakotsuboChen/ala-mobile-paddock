@@ -1,0 +1,6 @@
+# Caddy 反向代理：自动 HTTPS（QQ 开放平台 webhook 回调硬性要求 HTTPS）
+# domain 替换为实际域名；QQ 平台 IP 白名单填 VPS 公网地址
+
+paddock.example.com {
+    reverse_proxy app:8080
+}
