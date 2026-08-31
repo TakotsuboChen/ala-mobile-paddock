@@ -9,6 +9,7 @@ use rand::Rng;
 
 pub const TOKEN_TTL_DAYS: i64 = 90;
 pub const REG_CODE_TTL_MINUTES: i64 = 30;
+pub const RESET_CODE_TTL_MINUTES: i64 = 30;
 
 /// 校验用户名：1–16 字符；允许中文（\\u{4E00}-\\u{9FFF}）、字母、数字；
 /// 空格只允许出现在字符之间且不连续（"张三"、"Zhang San" 合法；" 张三"、"张 三 "、"张  三" 非法）。

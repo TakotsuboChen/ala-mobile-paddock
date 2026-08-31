@@ -109,10 +109,10 @@ pub async fn register_verify(
     }
     let user_id = Uuid::now_v7();
     let pass_hash = auth::hash_password(&req.password)?;
-    let reg_seq: i64 = sqlx::query_scalar::<_, i64>("SELECT count(*) FROM users")
+    // 车手 ID（定案：注册顺序，从 1 起）：用 Postgres 序列发放，并发注册不重号
+    let reg_seq: i64 = sqlx::query_scalar::<_, i64>("SELECT nextval('user_reg_seq')")
         .fetch_one(&mut *tx)
-        .await?
-        + 1;
+        .await?;
     sqlx::query(
         "INSERT INTO users (id, username, pass_hash, member_openid, reg_seq) VALUES ($1,$2,$3,$4,$5)",
     )
@@ -186,6 +186,70 @@ pub async fn login(
         username,
         reg_seq,
     }))
+}
+
+// ---- 密码重置（S4）：群内 "重置密码 用户名" → bot 生成码回复 → 模块提交新密码 ----
+
+/// bot 端：为用户生成一次性重置码（30 分钟时效）。由 webhook 处理器调用。
+pub async fn create_reset_code(pool: &PgPool, username: &str) -> Result<String, ApiError> {
+    let user_id: Option<(Uuid,)> =
+        sqlx::query_as("SELECT id FROM users WHERE username = $1")
+            .bind(username)
+            .fetch_optional(pool)
+            .await?;
+    let Some((user_id,)) = user_id else {
+        return Err(ApiError::not_found("用户名不存在"));
+    };
+    // 同一用户旧码先失效，保持"最后一码有效"的简单语义
+    sqlx::query("DELETE FROM reset_codes WHERE user_id = $1")
+        .bind(user_id)
+        .execute(pool)
+        .await?;
+    let code = auth::gen_reg_code();
+    let expires = Utc::now() + Duration::minutes(auth::RESET_CODE_TTL_MINUTES);
+    sqlx::query("INSERT INTO reset_codes (code, user_id, expires_at) VALUES ($1,$2,$3)")
+        .bind(&code)
+        .bind(user_id)
+        .bind(expires)
+        .execute(pool)
+        .await?;
+    Ok(code)
+}
+
+#[derive(Deserialize)]
+pub struct ResetByCode {
+    pub reset_code: String,
+    pub new_password: String,
+}
+
+/// POST /v1/auth/reset-by-code：模块端用码换新密码。旧 sessions 全部失效。
+pub async fn reset_by_code(
+    State(state): State<AppState>,
+    Json(req): Json<ResetByCode>,
+) -> Result<axum::http::StatusCode, ApiError> {
+    auth::validate_password(&req.new_password).map_err(ApiError::bad_request)?;
+    let mut tx = state.pool.begin().await?;
+    let row: Option<(Uuid,)> = sqlx::query_as(
+        "DELETE FROM reset_codes WHERE code = $1 AND expires_at > now() RETURNING user_id",
+    )
+    .bind(&req.reset_code)
+    .fetch_optional(&mut *tx)
+    .await?;
+    let Some((user_id,)) = row else {
+        return Err(ApiError::not_found("重置码无效或已过期，请在群内重新申请"));
+    };
+    let pass_hash = auth::hash_password(&req.new_password)?;
+    sqlx::query("UPDATE users SET pass_hash = $2 WHERE id = $1")
+        .bind(user_id)
+        .bind(&pass_hash)
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("DELETE FROM sessions WHERE user_id = $1")
+        .bind(user_id)
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await?;
+    Ok(axum::http::StatusCode::NO_CONTENT)
 }
 
 async fn user_exists(pool: &PgPool, username: &str) -> Result<bool, ApiError> {
@@ -262,6 +326,6 @@ pub fn router() -> Router<AppState> {
         .route("/auth/register-request", post(register_request))
         .route("/auth/register-verify", post(register_verify))
         .route("/auth/login", post(login))
-        // TODO(S4): /auth/reset-by-code —— bot 一次性码重置密码
+        .route("/auth/reset-by-code", post(reset_by_code))
         .route("/health", get(|| async { "ok" }))
 }

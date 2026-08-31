@@ -5,6 +5,7 @@
 mod admin;
 mod api;
 mod auth;
+mod qq_bot;
 mod state;
 
 use anyhow::Context;
@@ -33,10 +34,14 @@ async fn main() -> anyhow::Result<()> {
         .await
         .context("执行数据库迁移失败")?;
 
-    let app_state = state::AppState::new(pool);
+    // bot 发送队列：凭据由管理端设置页动态配置，worker 出队时实时读取，无需重启
+    let (bot_tx, bot_rx) = tokio::sync::mpsc::channel(64);
+    qq_bot::run_sender(pool.clone(), bot_rx);
+    let app_state = state::AppState::new(pool).with_bot_tx(bot_tx);
     let app = Router::new()
         .nest("/v1", api::router())
         .nest("/admin", admin::router())
+        .nest("/qq", qq_bot::router())
         .layer(TraceLayer::new_for_http())
         .with_state(app_state);
 
