@@ -1,0 +1,50 @@
+# paddock docker-compose 部署（VPS 8.134.50.222 实机版，2026-08-31）
+# 与仓内原版的差异：无 Caddy（80/443 由宿主机 openresty/1Panel 占用，反代由用户在面板侧配置），
+# app 发布到 127.0.0.1:8080 供 openresty proxy_pass；garage 3900 仅内网。
+# 契约源：../ala-mobile-tool/docs/PADDOCK_PLAN.md
+
+services:
+  app:
+    image: paddock-api:v1
+    restart: unless-stopped
+    environment:
+      DATABASE_URL: postgres://paddock:${POSTGRES_PASSWORD}@postgres:5432/paddock
+      BIND_ADDR: 0.0.0.0:8080
+      RUST_LOG: paddock_api=info,tower_http=warn
+      PADDOCK_ADMIN_USER: admin
+      PADDOCK_ADMIN_PASS: ${PADDOCK_ADMIN_PASS}
+    ports:
+      - "127.0.0.1:8080:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  postgres:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: paddock
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: paddock
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U paddock"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  garage:
+    image: dxflrs/garage:v1.1.0
+    restart: unless-stopped
+    volumes:
+      - garage-data:/var/lib/garage/data
+      - garage-meta:/var/lib/garage/meta
+      - ./garage.toml:/etc/garage.toml:ro
+    expose:
+      - "3900"   # S3 API（仅内网）
+
+volumes:
+  pgdata:
+  garage-data:
+  garage-meta:

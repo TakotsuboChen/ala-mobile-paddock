@@ -7,7 +7,7 @@ replication_factor = 1
 
 rpc_bind_addr = "[::]:3901"
 rpc_public_addr = "127.0.0.1:3901"
-rpc_secret = "placeholder-replace-with-32-byte-hex"
+rpc_secret = "fe59cec6195f5af68305cd1cb718059fb5ddfb8385a8810c95542d506a04b5ae"
 
 [s3_api]
 s3_region = "paddock"
