@@ -1,0 +1,33 @@
+<h2>设置</h2>
+{% if !notice.is_empty() %}<p class="notice">{{ notice }}</p>{% endif %}
+
+<h3 style="color:#8af;margin-top:1.2rem">QQ 机器人（CAMDA 群）</h3>
+<form method="post" action="/admin/settings/bot" style="max-width:560px">
+  <label style="display:block;margin:.6rem 0 .2rem">AppID</label>
+  <input name="bot_app_id" value="{{ bot_app_id }}" style="width:100%;box-sizing:border-box;padding:.5rem;border:1px solid #444;border-radius:8px;background:#2a2a2c;color:#eee">
+  <label style="display:block;margin:.6rem 0 .2rem">AppSecret {% if bot_secret_set %}<span style="color:#7c7">（已设置，留空保留）</span>{% endif %}</label>
+  <input name="bot_app_secret" type="password" value="" placeholder="{% if bot_secret_set %}留空 = 不修改{% else %}必填{% endif %}" style="width:100%;box-sizing:border-box;padding:.5rem;border:1px solid #444;border-radius:8px;background:#2a2a2c;color:#eee">
+  <p style="color:#777;font-size:.85rem">webhook 回调地址：<span class="code">https://&lt;域名&gt;/qq/webhook</span>（开放平台「回调配置」填此地址，勾选 <span class="code">GROUP_MESSAGE_CREATE</span>；IP 白名单填服务器公网地址）</p>
+  <button class="btn" style="margin-top:.6rem">保存</button>
+</form>
+
+<h3 style="color:#8af;margin-top:2rem">管理员账号</h3>
+<form method="post" action="/admin/settings/username" style="max-width:560px">
+  <label style="display:block;margin:.6rem 0 .2rem">新用户名</label>
+  <input name="new_username" value="" placeholder="1–32 字符" required style="width:100%;box-sizing:border-box;padding:.5rem;border:1px solid #444;border-radius:8px;background:#2a2a2c;color:#eee">
+  <label style="display:block;margin:.6rem 0 .2rem">当前密码（验证）</label>
+  <input name="password" type="password" required style="width:100%;box-sizing:border-box;padding:.5rem;border:1px solid #444;border-radius:8px;background:#2a2a2c;color:#eee">
+  <button class="btn" style="margin-top:.6rem">修改用户名</button>
+  <p style="color:#777;font-size:.85rem">修改后需用新用户名重新登录。</p>
+</form>
+
+<h3 style="color:#8af;margin-top:2rem">管理员密码</h3>
+<form method="post" action="/admin/settings/password" style="max-width:560px">
+  <label style="display:block;margin:.6rem 0 .2rem">当前密码</label>
+  <input name="old_password" type="password" required style="width:100%;box-sizing:border-box;padding:.5rem;border:1px solid #444;border-radius:8px;background:#2a2a2c;color:#eee">
+  <label style="display:block;margin:.6rem 0 .2rem">新密码（≥8 位，含数字和字母）</label>
+  <input name="new_password" type="password" required style="width:100%;box-sizing:border-box;padding:.5rem;border:1px solid #444;border-radius:8px;background:#2a2a2c;color:#eee">
+  <label style="display:block;margin:.6rem 0 .2rem">确认新密码</label>
+  <input name="new_password2" type="password" required style="width:100%;box-sizing:border-box;padding:.5rem;border:1px solid #444;border-radius:8px;background:#2a2a2c;color:#eee">
+  <button class="btn" style="margin-top:.6rem">修改密码</button>
+</form>

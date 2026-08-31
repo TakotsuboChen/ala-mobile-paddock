@@ -1,13 +1,22 @@
 <h2>用户管理（{{ users.len() }}）</h2>
+{% if !notice.is_empty() %}<p class="notice">{{ notice }}</p>{% endif %}
 <table>
-<tr><th>#</th><th>用户名</th><th>member_openid</th><th>最好成绩数</th><th>注册日</th></tr>
+<tr><th>车手 ID</th><th>用户名</th><th>member_openid</th><th>最好成绩数</th><th>注册日</th><th>操作</th></tr>
 {% for u in users %}
 <tr>
-  <td>{{ u.reg_seq }}</td>
+  <td class="code">{{ u.reg_seq }}</td>
   <td>{{ u.username }}</td>
   <td class="code">{% if u.member_openid.is_empty() %}<i style="color:#777">未绑定</i>{% else %}{{ u.member_openid }}{% endif %}</td>
   <td>{{ u.best_count }}</td>
   <td>{{ u.created }}</td>
+  <td>
+    <form class="inline" method="post" action="/admin/users/{{ u.id }}/reset-password"
+          onsubmit="return confirm('把 {{ u.username }} 的密码重置为输入的新密码？')">
+      <input name="new_password" placeholder="新密码" required style="width:150px">
+      <button class="btn">重置密码</button>
+    </form>
+  </td>
 </tr>
 {% endfor %}
+{% if users.is_empty() %}<tr><td colspan="6" style="color:#777">暂无车手</td></tr>{% endif %}
 </table>

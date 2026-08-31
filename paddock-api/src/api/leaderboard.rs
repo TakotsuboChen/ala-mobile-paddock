@@ -22,6 +22,7 @@ pub struct VersionFilter {
 #[derive(Serialize, sqlx::FromRow)]
 pub struct PointsEntry {
     pub user_id: Uuid,
+    pub reg_seq: i64,
     pub username: String,
     pub avatar_url: Option<String>,
     pub points: i64,
@@ -51,7 +52,7 @@ pub async fn points_board(
                             count(*) OVER (PARTITION BY gp_index) AS n_in_track
                      FROM best_laps WHERE version_code = $1
                    )
-                   SELECT u.id AS user_id, u.username AS username, NULL::text AS avatar_url,
+                   SELECT u.id AS user_id, u.reg_seq AS reg_seq, u.username AS username, NULL::text AS avatar_url,
                           (CASE WHEN n_in_track = 1 THEN 100
                                 ELSE round(1 + (n_in_track - rank_in_track)::numeric * 99 / (n_in_track - 1))
                            END)::bigint AS points
@@ -65,7 +66,7 @@ pub async fn points_board(
             // 聚合到用户级
             .fold(std::collections::HashMap::<Uuid, PointsEntry>::new(), |mut m, e| {
                 let entry = m.entry(e.user_id).or_insert(PointsEntry {
-                    user_id: e.user_id, username: e.username.clone(), avatar_url: None, points: 0,
+                    user_id: e.user_id, reg_seq: e.reg_seq, username: e.username.clone(), avatar_url: None, points: 0,
                 });
                 entry.points += e.points;
                 m
@@ -86,7 +87,7 @@ pub async fn points_board(
                             count(*) OVER (PARTITION BY gp_index) AS n_in_track
                      FROM user_best
                    )
-                   SELECT u.id AS user_id, u.username AS username, NULL::text AS avatar_url,
+                   SELECT u.id AS user_id, u.reg_seq AS reg_seq, u.username AS username, NULL::text AS avatar_url,
                           (CASE WHEN n_in_track = 1 THEN 100
                                 ELSE round(1 + (n_in_track - rank_in_track)::numeric * 99 / (n_in_track - 1))
                            END)::bigint AS points
@@ -98,7 +99,7 @@ pub async fn points_board(
             .into_iter()
             .fold(std::collections::HashMap::<Uuid, PointsEntry>::new(), |mut m, e| {
                 let entry = m.entry(e.user_id).or_insert(PointsEntry {
-                    user_id: e.user_id, username: e.username.clone(), avatar_url: None, points: 0,
+                    user_id: e.user_id, reg_seq: e.reg_seq, username: e.username.clone(), avatar_url: None, points: 0,
                 });
                 entry.points += e.points;
                 m
@@ -123,6 +124,8 @@ pub async fn points_board(
 pub struct TrackEntry {
     pub rank: i64,
     pub user_id: Uuid,
+    /// 车手 ID（注册顺序，从 1 起）
+    pub reg_seq: i64,
     pub username: String,
     pub lap_ms: i32,
     /// 服务端格式化的圈时（mm:ss.mmm）
@@ -146,9 +149,9 @@ pub async fn track_board(
     if !(0..16).contains(&gp_index) {
         return Err(ApiError::bad_request("gp_index 越界（0..15）"));
     }
-    let rows: Vec<(Uuid, String, i32)> = match f.version {
+    let rows: Vec<(Uuid, i64, String, i32)> = match f.version {
         Some(v) => sqlx::query_as(
-            "SELECT b.user_id, u.username, b.lap_ms FROM best_laps b JOIN users u ON u.id=b.user_id \
+            "SELECT b.user_id, u.reg_seq, u.username, b.lap_ms FROM best_laps b JOIN users u ON u.id=b.user_id \
              WHERE b.gp_index=$1 AND b.version_code=$2 ORDER BY b.lap_ms ASC",
         )
         .bind(gp_index)
@@ -158,7 +161,7 @@ pub async fn track_board(
         ?,
         None => {
             sqlx::query_as(
-                "SELECT ub.user_id, u.username, ub.lap_ms FROM \
+                "SELECT ub.user_id, u.reg_seq, u.username, ub.lap_ms FROM \
                  (SELECT user_id, min(lap_ms) AS lap_ms FROM best_laps WHERE gp_index=$1 GROUP BY user_id) ub \
                  JOIN users u ON u.id=ub.user_id ORDER BY ub.lap_ms ASC",
             )
@@ -171,9 +174,10 @@ pub async fn track_board(
     let entries = rows
         .into_iter()
         .enumerate()
-        .map(|(i, (user_id, username, lap_ms))| TrackEntry {
+        .map(|(i, (user_id, reg_seq, username, lap_ms))| TrackEntry {
             rank: (i + 1) as i64,
             user_id,
+            reg_seq,
             username,
             lap_ms,
             lap_display: format_lap_ms(lap_ms),

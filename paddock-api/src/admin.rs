@@ -31,13 +31,13 @@ struct DashTemplate {
     title: &'static str,
     active: &'static str,
     content: String,
-    admin_user: String,
 }
 
 #[derive(Template)]
 #[template(path = "admin_users.html")]
 struct UsersTemplate {
     users: Vec<UserRow>,
+    notice: String,
 }
 
 struct UserRow {
@@ -226,12 +226,11 @@ async fn users_page(State(state): State<App>, headers: HeaderMap) -> Response {
         },
     )
     .collect();
-    let body = UsersTemplate { users: rows }.render().unwrap();
+    let body = UsersTemplate { users: rows, notice: String::new() }.render().unwrap();
     let t = DashTemplate {
         title: "用户管理",
         active: "users",
         content: body,
-        admin_user: "admin".into(),
     };
     html_res(StatusCode::OK, t.render().unwrap())
 }
@@ -273,7 +272,6 @@ async fn render_pending(state: &App, notice: String) -> Response {
         title: "注册会话 · 代绑",
         active: "pending",
         content: body,
-        admin_user: "admin".into(),
     };
     html_res(StatusCode::OK, t.render().unwrap())
 }
@@ -362,7 +360,6 @@ async fn render_laps(state: &App, qname: &str, notice: String) -> Response {
         title: "成绩管理",
         active: "laps",
         content: body,
-        admin_user: "admin".into(),
     };
     html_res(StatusCode::OK, t.render().unwrap())
 }
@@ -498,6 +495,283 @@ async fn admin_name(state: &App, headers: &HeaderMap) -> Option<String> {
         .map(|_| "admin".to_string())
 }
 
+// ---------- 设置页（S4：改密码 + bot 配置 + 用户密码重置） ----------
+
+#[derive(Template)]
+#[template(path = "admin_settings.html")]
+struct SettingsTemplate {
+    bot_app_id: String,
+    bot_secret_set: bool,
+    notice: String,
+}
+
+async fn settings_page(State(state): State<App>, headers: HeaderMap) -> Response {
+    if require_admin(&state, &headers).await.is_none() {
+        return Redirect::to("/admin").into_response();
+    }
+    render_settings(&state, String::new()).await
+}
+
+async fn render_settings(state: &App, notice: String) -> Response {
+    let app_id = crate::qq_bot::get_cfg(&state.pool, "bot_app_id")
+        .await
+        .unwrap_or_default();
+    let secret_set = crate::qq_bot::get_cfg(&state.pool, "bot_app_secret")
+        .await
+        .map(|s| !s.is_empty())
+        .unwrap_or(false);
+    let body = SettingsTemplate {
+        bot_app_id: app_id,
+        bot_secret_set: secret_set,
+        notice,
+    }
+    .render()
+    .unwrap();
+    let t = DashTemplate {
+        title: "设置",
+        active: "settings",
+        content: body,
+    };
+    html_res(StatusCode::OK, t.render().unwrap())
+}
+
+#[derive(Deserialize)]
+struct ChangePwForm {
+    old_password: String,
+    new_password: String,
+    new_password2: String,
+}
+
+async fn change_password(
+    State(state): State<App>,
+    headers: HeaderMap,
+    Form(f): Form<ChangePwForm>,
+) -> Response {
+    let Some(admin) = admin_name(&state, &headers).await else {
+        return Redirect::to("/admin").into_response();
+    };
+    if f.new_password != f.new_password2 {
+        return render_settings(&state, "两次输入的新密码不一致".into()).await;
+    }
+    if crate::auth::validate_password(&f.new_password).is_err() {
+        return render_settings(
+            &state,
+            "新密码至少 8 位，且须同时包含数字和字母".into(),
+        )
+        .await;
+    }
+    let row: Option<(String,)> =
+        sqlx::query_as("SELECT pass_hash FROM admins WHERE username = $1")
+            .bind(&admin)
+            .fetch_optional(&state.pool)
+            .await
+            .unwrap_or(None);
+    let ok = row
+        .map(|(h,)| crate::auth::verify_password(&f.old_password, &h))
+        .unwrap_or(false);
+    if !ok {
+        return render_settings(&state, "当前密码错误".into()).await;
+    }
+    let new_hash = match crate::auth::hash_password(&f.new_password) {
+        Ok(h) => h,
+        Err(_) => return render_settings(&state, "密码哈希失败".into()).await,
+    };
+    sqlx::query("UPDATE admins SET pass_hash = $2 WHERE username = $1")
+        .bind(&admin)
+        .bind(&new_hash)
+        .execute(&state.pool)
+        .await
+        .ok();
+    // 改密后作废全部管理端会话，用新密码重新登录
+    sqlx::query("DELETE FROM admin_sessions")
+        .execute(&state.pool)
+        .await
+        .ok();
+    audit(&state.pool, "change_admin_password", serde_json::json!({})).await;
+    Redirect::to("/admin").into_response()
+}
+
+#[derive(Deserialize)]
+struct ChangeUsernameForm {
+    new_username: String,
+    password: String,
+}
+
+/// 修改管理员用户名：需验证当前密码防会话劫持。改完作废全部管理端会话。
+async fn change_username(
+    State(state): State<App>,
+    headers: HeaderMap,
+    Form(f): Form<ChangeUsernameForm>,
+) -> Response {
+    let Some(admin) = admin_name(&state, &headers).await else {
+        return Redirect::to("/admin").into_response();
+    };
+    let name = f.new_username.trim();
+    if name.is_empty() || name.len() > 32 {
+        return render_settings(&state, "用户名 1–32 字符".into()).await;
+    }
+    let row: Option<(String,)> =
+        sqlx::query_as("SELECT pass_hash FROM admins WHERE username = $1")
+            .bind(&admin)
+            .fetch_optional(&state.pool)
+            .await
+            .unwrap_or(None);
+    let ok = row
+        .map(|(h,)| crate::auth::verify_password(&f.password, &h))
+        .unwrap_or(false);
+    if !ok {
+        return render_settings(&state, "密码错误".into()).await;
+    }
+    let taken: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM admins WHERE username = $1 AND username <> $2")
+            .bind(name)
+            .bind(&admin)
+            .fetch_one(&state.pool)
+            .await
+            .unwrap_or(1);
+    if taken > 0 {
+        return render_settings(&state, "该用户名已被占用".into()).await;
+    }
+    sqlx::query("UPDATE admins SET username = $2 WHERE username = $1")
+        .bind(&admin)
+        .bind(name)
+        .execute(&state.pool)
+        .await
+        .ok();
+    sqlx::query("DELETE FROM admin_sessions")
+        .execute(&state.pool)
+        .await
+        .ok();
+    audit(&state.pool, "change_admin_username", serde_json::json!({"new": name})).await;
+    Redirect::to("/admin").into_response()
+}
+
+#[derive(Deserialize)]
+struct BotConfigForm {
+    bot_app_id: String,
+    bot_app_secret: String,
+}
+
+/// bot 凭据保存。secret 留空 = 保留原值（不回显，防泄露）。
+async fn save_bot_config(
+    State(state): State<App>,
+    headers: HeaderMap,
+    Form(f): Form<BotConfigForm>,
+) -> Response {
+    if require_admin(&state, &headers).await.is_none() {
+        return Redirect::to("/admin").into_response();
+    }
+    let notice = match async {
+        crate::qq_bot::set_cfg(&state.pool, "bot_app_id", f.bot_app_id.trim()).await?;
+        if !f.bot_app_secret.trim().is_empty() {
+            crate::qq_bot::set_cfg(&state.pool, "bot_app_secret", f.bot_app_secret.trim()).await?;
+        }
+        anyhow::Ok(())
+    }
+    .await
+    {
+        Ok(()) => {
+            audit(
+                &state.pool,
+                "save_bot_config",
+                serde_json::json!({"app_id": f.bot_app_id.trim()}),
+            )
+            .await;
+            "bot 配置已保存（即时生效，无需重启）。请回 QQ 开放平台重新触发回调验证".to_string()
+        }
+        Err(_) => "保存失败，请重试".to_string(),
+    };
+    render_settings(&state, notice).await
+}
+
+#[derive(Deserialize)]
+struct AdminResetForm {
+    new_password: String,
+}
+
+/// 人工重置密码（PADDOCK_PLAN §1"管理端同时留人工重置入口"）：直接设新密码，
+/// 作废该用户全部模块会话。与 bot 码重置等效但绕过群流程。
+async fn admin_reset_password(
+    State(state): State<App>,
+    headers: HeaderMap,
+    Path(user_id): Path<Uuid>,
+    Form(f): Form<AdminResetForm>,
+) -> Response {
+    let Some(admin) = admin_name(&state, &headers).await else {
+        return Redirect::to("/admin").into_response();
+    };
+    let notice = if crate::auth::validate_password(&f.new_password).is_err() {
+        "密码至少 8 位，且须同时包含数字和字母".to_string()
+    } else {
+        match crate::auth::hash_password(&f.new_password) {
+            Ok(hash) => {
+                let mut tx = state.pool.begin().await.ok().unwrap();
+                sqlx::query("UPDATE users SET pass_hash=$2 WHERE id=$1")
+                    .bind(user_id)
+                    .bind(&hash)
+                    .execute(&mut *tx)
+                    .await
+                    .ok();
+                sqlx::query("DELETE FROM sessions WHERE user_id=$1")
+                    .bind(user_id)
+                    .execute(&mut *tx)
+                    .await
+                    .ok();
+                sqlx::query(
+                    "INSERT INTO admin_audit (admin_user, action, detail) VALUES ($1,'reset_password',$2)",
+                )
+                .bind(&admin)
+                .bind(serde_json::json!({"user_id": user_id.to_string()}))
+                .execute(&mut *tx)
+                .await
+                .ok();
+                tx.commit().await.ok();
+                "密码已重置（该用户所有登录已失效）".to_string()
+            }
+            Err(_) => "密码哈希失败".to_string(),
+        }
+    };
+    render_users_with_notice(&state, notice).await
+}
+
+async fn render_users_with_notice(state: &App, notice: String) -> Response {
+    // 与 users_page 相同的行渲染逻辑；notice 显示在用户列表页顶部
+    let rows: Vec<UserRow> = sqlx::query_as(
+        "SELECT u.id, u.username, u.member_openid, u.reg_seq, u.created_at, \
+         (SELECT count(*) FROM best_laps b WHERE b.user_id = u.id) \
+         FROM users u ORDER BY u.reg_seq ASC LIMIT 500",
+    )
+    .fetch_all(&state.pool)
+    .await
+    .unwrap_or_default()
+    .into_iter()
+    .map(
+        |(id, username, openid, seq, created, cnt): (
+            Uuid,
+            String,
+            Option<String>,
+            i64,
+            chrono::DateTime<Utc>,
+            i64,
+        )| UserRow {
+            id: id.to_string(),
+            username,
+            member_openid: openid.unwrap_or_default(),
+            reg_seq: seq,
+            created: created.format("%Y-%m-%d").to_string(),
+            best_count: cnt,
+        },
+    )
+    .collect();
+    let body = UsersTemplate { users: rows, notice }.render().unwrap();
+    let t = DashTemplate {
+        title: "用户管理",
+        active: "users",
+        content: body,
+    };
+    html_res(StatusCode::OK, t.render().unwrap())
+}
+
 async fn audit(pool: &PgPool, action: &str, detail: serde_json::Value) {
     sqlx::query("INSERT INTO admin_audit (admin_user, action, detail) VALUES ('admin',$1,$2)")
         .bind(action)
@@ -517,4 +791,9 @@ pub fn router() -> Router<App> {
         .route("/pending/bind", post(bind_submit))
         .route("/laps", get(laps_page))
         .route("/laps/{id}/delete", post(delete_lap))
+        .route("/settings", get(settings_page))
+        .route("/settings/password", post(change_password))
+        .route("/settings/username", post(change_username))
+        .route("/settings/bot", post(save_bot_config))
+        .route("/users/{id}/reset-password", post(admin_reset_password))
 }
