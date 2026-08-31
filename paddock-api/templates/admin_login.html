@@ -1,0 +1,27 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>围场管理端 · 登录</title>
+<style>
+  body{font-family:system-ui,sans-serif;background:#111;color:#eee;display:flex;justify-content:center;padding-top:18vh;margin:0}
+  .card{background:#1c1c1e;border-radius:12px;padding:2rem;width:320px}
+  h1{font-size:1.2rem;margin-top:0}
+  input{width:100%;box-sizing:border-box;margin:.4rem 0;padding:.6rem;border:1px solid #444;border-radius:8px;background:#2a2a2c;color:#eee}
+  button{width:100%;margin-top:.8rem;padding:.6rem;border:0;border-radius:8px;background:#4c8dff;color:#fff;font-size:1rem;cursor:pointer}
+  .err{color:#ff6b6b;font-size:.9rem;min-height:1.2em}
+</style>
+</head>
+<body>
+<div class="card">
+  <h1>🏁 围场管理端</h1>
+  <p class="err">{{ error }}</p>
+  <form method="post" action="/admin/login">
+    <input name="username" placeholder="管理员用户名" autofocus>
+    <input name="password" type="password" placeholder="密码">
+    <button type="submit">登录</button>
+  </form>
+</div>
+</body>
+</html>

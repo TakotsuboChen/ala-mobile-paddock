@@ -1,0 +1,25 @@
+<h2>注册会话 · 代绑 openid</h2>
+{% if !notice.is_empty() %}<p class="notice">{{ notice }}</p>{% endif %}
+<p style="color:#8af;font-size:.85rem">bot 未上线期间：用户在群内发码后，从 QQ 开放平台「消息与事件」日志或 bot 调试日志复制其 member_openid，填入绑定。</p>
+<table>
+<tr><th>校验码</th><th>用户名</th><th>member_openid</th><th>状态</th><th>过期时刻</th><th>操作</th></tr>
+{% for r in rows %}
+<tr>
+  <td class="code">{{ r.reg_code }}</td>
+  <td>{{ r.username }}</td>
+  <td class="code">{{ r.member_openid }}</td>
+  <td>{{ r.status }}</td>
+  <td>{{ r.expires }}</td>
+  <td>
+    {% if r.status == "pending" %}
+    <form class="inline" method="post" action="/admin/pending/bind">
+      <input type="hidden" name="reg_code" value="{{ r.reg_code }}">
+      <input name="member_openid" placeholder="粘贴 openid" required style="width:220px">
+      <button class="btn">代绑</button>
+    </form>
+    {% endif %}
+  </td>
+</tr>
+{% endfor %}
+{% if rows.is_empty() %}<tr><td colspan="6" style="color:#777">无在途会话</td></tr>{% endif %}
+</table>

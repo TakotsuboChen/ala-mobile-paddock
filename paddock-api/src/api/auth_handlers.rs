@@ -44,7 +44,9 @@ pub async fn register_request(
     .fetch_one(&state.pool)
     .await?;
     if pending_same_name > 0 {
-        return Err(ApiError::conflict("该用户名已有注册申请在途，请等待其完成或过期后再试"));
+        return Err(ApiError::conflict(
+            "该用户名已有注册申请在途，请等待其完成或过期后再试",
+        ));
     }
     let reg_code = auth::gen_reg_code();
     let expires = Utc::now() + Duration::minutes(auth::REG_CODE_TTL_MINUTES);
@@ -87,7 +89,9 @@ pub async fn register_verify(
     };
     // username 必须与申请时锁存的一致（防拿别人的码换名建号）
     if req.username != locked_username {
-        return Err(ApiError::bad_request("用户名与申请时不一致，请使用申请时的用户名"));
+        return Err(ApiError::bad_request(
+            "用户名与申请时不一致，请使用申请时的用户名",
+        ));
     }
     if status != "verified" || member_openid.is_none() {
         return Err(ApiError::bad_request(

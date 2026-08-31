@@ -1,0 +1,25 @@
+<h2>成绩管理</h2>
+{% if !notice.is_empty() %}<p class="notice">{{ notice }}</p>{% endif %}
+<form method="get" action="/admin/laps" style="margin-bottom:.8rem">
+  <input name="q" value="" placeholder="按用户名筛选" style="padding:.4rem;border-radius:6px;border:1px solid #444;background:#2a2a2c;color:#eee">
+  <button class="btn">筛选</button>
+</form>
+<table>
+<tr><th>时间</th><th>用户</th><th>赛道</th><th>版本</th><th>圈时</th><th>操作</th></tr>
+{% for l in rows %}
+<tr>
+  <td class="code">{{ l.created }}</td>
+  <td>{{ l.username }}</td>
+  <td>{{ l.track }}</td>
+  <td class="code">{{ l.version_code }}</td>
+  <td class="code">{{ l.lap_display }}</td>
+  <td>
+    <form class="inline" method="post" action="/admin/laps/{{ l.id }}/delete"
+          onsubmit="return confirm('删除该圈并重算榜单/纪录？')">
+      <button class="btn danger">删除</button>
+    </form>
+  </td>
+</tr>
+{% endfor %}
+{% if rows.is_empty() %}<tr><td colspan="6" style="color:#777">无成绩记录</td></tr>{% endif %}
+</table>

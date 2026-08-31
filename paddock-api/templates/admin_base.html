@@ -1,0 +1,37 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>围场管理端 · {{ title }}</title>
+<style>
+  body{font-family:system-ui,sans-serif;background:#111;color:#eee;margin:0}
+  nav{display:flex;gap:1rem;align-items:center;background:#1c1c1e;padding:.7rem 1.2rem}
+  nav a{color:#9ab;text-decoration:none;padding:.2rem .6rem;border-radius:6px}
+  nav a.active{background:#2a2a2e;color:#fff}
+  nav .spacer{flex:1}
+  main{max-width:960px;margin:1.5rem auto;padding:0 1rem}
+  table{width:100%;border-collapse:collapse;font-size:.92rem}
+  th,td{text-align:left;padding:.45rem .6rem;border-bottom:1px solid #2a2a2c}
+  th{color:#8af}
+  .btn{display:inline-block;padding:.25rem .7rem;border:0;border-radius:6px;background:#4a4a4e;color:#eee;cursor:pointer;text-decoration:none;font-size:.85rem}
+  .btn.danger{background:#a33}
+  .notice{background:#243; color:#cfc; padding:.5rem .8rem;border-radius:8px;margin-bottom:.8rem}
+  .code{font-family:ui-monospace,monospace}
+  form.inline{display:inline}
+</style>
+</head>
+<body>
+<nav>
+  <strong>🏁 围场</strong>
+  <a href="/admin/users" class="{% if active == "users" %}active{% endif %}">用户</a>
+  <a href="/admin/pending" class="{% if active == "pending" %}active{% endif %}">注册代绑</a>
+  <a href="/admin/laps" class="{% if active == "laps" %}active{% endif %}">成绩</a>
+  <span class="spacer"></span>
+  <form class="inline" method="post" action="/admin/logout"><button class="btn">退出</button></form>
+</nav>
+<main>
+  {{ content | safe }}
+</main>
+</body>
+</html>

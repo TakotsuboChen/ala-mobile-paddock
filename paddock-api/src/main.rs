@@ -2,6 +2,7 @@
 //! 架构：axum 单二进制 = /v1/* 模块 API + /admin/* 管理页 + /qq/webhook（S4）。
 //! 契约源：ala-mobile-tool 仓库 docs/PADDOCK_PLAN.md（两边共用，勿单侧演化）。
 
+mod admin;
 mod api;
 mod auth;
 mod state;
@@ -35,6 +36,7 @@ async fn main() -> anyhow::Result<()> {
     let app_state = state::AppState::new(pool);
     let app = Router::new()
         .nest("/v1", api::router())
+        .nest("/admin", admin::router())
         .layer(TraceLayer::new_for_http())
         .with_state(app_state);
 

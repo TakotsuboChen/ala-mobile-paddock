@@ -19,6 +19,7 @@ argon2 = "0.5"
 uuid = { version = "1", features = ["v4", "v7", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }
 thiserror = "2"
+askama = "0.14"
 anyhow = "1"
 rand = "0.9"
 tracing = "0.1"
