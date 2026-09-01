@@ -195,7 +195,9 @@ async fn handle_group_message(state: &App, event_id: &str, d: &Value) {
     // 其余群内聊天不响应（bot 静默）
 }
 
-/// 注册码监听：码 → pending_regs 锁定 member_openid + 置 verified → 被动回复。
+/// 注册码监听：码 → pending_regs 定位会话 → 绑定 member_openid 并**直接建号** → 被动回复。
+/// 新流程（2026-09-01 定案 v2）：申请时已存密码哈希+车手 ID，校验成功即建号并回复序号；
+/// 用户回模块用申请时的账号密码直接登录。
 /// 约束（PADDOCK_PLAN §6 S4）：一条码一openid；重复绑定他人码会被唯一约束拦。
 async fn handle_reg_code(
     state: &App,
@@ -228,20 +230,30 @@ async fn handle_reg_code(
                 if occupied.is_some() {
                     "该 QQ 身份已有其他注册校验在途，请勿重复申请".to_string()
                 } else {
-                    let n = sqlx::query(
-                        "UPDATE pending_regs SET member_openid = $2, status = 'verified' \
-                         WHERE reg_code = $1 AND status = 'pending' AND expires_at > now()",
-                    )
-                    .bind(code)
-                    .bind(member_openid)
-                    .execute(&state.pool)
-                    .await
-                    .map(|r| r.rows_affected())
-                    .unwrap_or(0);
-                    if n > 0 {
-                        format!("校验成功！请在围场页输入校验码 {code} 并设置密码完成注册")
-                    } else {
-                        format!("校验码 {code} 无效或已过期，请在围场页重新申请")
+                    // 建号事务：DELETE pending RETURNING 锁存数据 → INSERT users。
+                    // 失败时 pending 已被事务回滚恢复，用户可重试。
+                    match auth_handlers::create_user_from_pending(&state.pool, code, member_openid).await {
+                        Ok(user_id) => {
+                            let username: String = sqlx::query_scalar(
+                                "SELECT username FROM users WHERE id = $1",
+                            )
+                            .bind(user_id)
+                            .fetch_one(&state.pool)
+                            .await
+                            .unwrap_or_default();
+                            let reg_seq: i64 = sqlx::query_scalar(
+                                "SELECT reg_seq FROM users WHERE id = $1",
+                            )
+                            .bind(user_id)
+                            .fetch_one(&state.pool)
+                            .await
+                            .unwrap_or(0);
+                            format!("@{username} 校验成功，欢迎您加入 CAMDA，您是全服第 {reg_seq} 位车手！请返回模块直接点击登录。")
+                        }
+                        Err((status, msg)) => {
+                            tracing::warn!("建号失败 {status}: {msg}（code={code}）");
+                            msg
+                        }
                     }
                 }
             }

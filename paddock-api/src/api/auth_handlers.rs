@@ -1,7 +1,8 @@
-//! 认证端点：注册申请 / 注册校验 / 登录 / 一次性码重置。
-//! 注册闭环（定案）：模块申请码 → 用户在 CAMDA 群发"申请围场通行证#XXXXXXXX"
-//! → bot 用码定位 pending 会话绑定 member_openid → 模块 verify 建号并登录。
-//! bot 未上线（S1）期间由管理端代绑 member_openid。
+//! 认证端点：注册申请 / 登录 / 一次性码重置。
+//! 注册闭环（2026-09-01 定案 v2：bot 校验即建号）：模块申请（username+password，服务端
+//! 哈希密码+发车手 ID 存 pending 会话）→ 用户在 CAMDA 群发"申请围场通行证#XXXXXXXX"
+//! → bot 用码定位会话绑定 member_openid **并直接建号**（回复车手 ID）→ 用户回模块
+//! 用同一账号密码直接登录。旧 register-verify 端点已删（bot 建号后无 verify 步骤）。
 
 use axum::{
     Json, Router,
@@ -19,6 +20,7 @@ use crate::{auth, state::AppState};
 #[derive(Deserialize)]
 pub struct RegisterRequest {
     pub username: String,
+    pub password: String,
 }
 
 #[derive(Serialize)]
@@ -32,7 +34,8 @@ pub async fn register_request(
     State(state): State<AppState>,
     Json(req): Json<RegisterRequest>,
 ) -> Result<Json<RegisterRequestResp>, ApiError> {
-    auth::validate_username(&req.username).map_err(|e| ApiError::bad_request(e))?;
+    auth::validate_username(&req.username).map_err(ApiError::bad_request)?;
+    auth::validate_password(&req.password).map_err(ApiError::bad_request)?;
     if user_exists(&state.pool, &req.username).await? {
         return Err(ApiError::conflict("用户名已存在（不允许重复注册）"));
     }
@@ -49,98 +52,80 @@ pub async fn register_request(
         ));
     }
     let reg_code = auth::gen_reg_code();
-    let expires = Utc::now() + Duration::minutes(auth::REG_CODE_TTL_MINUTES);
-    sqlx::query("INSERT INTO pending_regs (reg_code, username, expires_at) VALUES ($1, $2, $3)")
-        .bind(&reg_code)
-        .bind(&req.username)
-        .bind(expires)
-        .execute(&state.pool)
+    let pass_hash = auth::hash_password(&req.password)?;
+    // 车手 ID 申请时即发放（bot 回复需要序号）；未完成注册的号作废（顺序不乱，允许空缺）
+    let reg_seq: i64 = sqlx::query_scalar::<_, i64>("SELECT nextval('user_reg_seq')")
+        .fetch_one(&state.pool)
         .await?;
+    let expires = Utc::now() + Duration::minutes(auth::REG_CODE_TTL_MINUTES);
+    sqlx::query(
+        "INSERT INTO pending_regs (reg_code, username, pass_hash, reg_seq, expires_at) \
+         VALUES ($1, $2, $3, $4, $5)",
+    )
+    .bind(&reg_code)
+    .bind(&req.username)
+    .bind(&pass_hash)
+    .bind(reg_seq)
+    .bind(expires)
+    .execute(&state.pool)
+    .await?;
     Ok(Json(RegisterRequestResp {
         message_hint: format!("申请围场通行证#{reg_code}"),
         reg_code,
     }))
 }
 
-#[derive(Deserialize)]
-pub struct RegisterVerify {
-    pub reg_code: String,
-    pub username: String,
-    pub password: String,
-}
-
-/// 校验通过后建号。要求 pending 会话已被 bot（或管理端）绑上 member_openid。
-pub async fn register_verify(
-    State(state): State<AppState>,
-    Json(req): Json<RegisterVerify>,
-) -> Result<(axum::http::StatusCode, Json<LoginResp>), ApiError> {
-    auth::validate_username(&req.username).map_err(ApiError::bad_request)?;
-    auth::validate_password(&req.password).map_err(ApiError::bad_request)?;
-
-    let mut tx = state.pool.begin().await?;
-    let row: Option<(Option<String>, String, String)> = sqlx::query_as(
-        "DELETE FROM pending_regs WHERE reg_code = $1 AND expires_at > now() RETURNING member_openid, status, username",
+/// 建号事务（bot 校验成功即调）：pending 会话已被绑上 member_openid，
+/// DELETE ... RETURNING 拿到锁存的用户名/密码哈希/车手 ID → INSERT users → 提交。
+/// 公开给 qq_bot 调用；建号失败（openid 已绑号等）由调用方回滚并回复错误文案。
+pub async fn create_user_from_pending(
+    pool: &PgPool,
+    reg_code: &str,
+    member_openid: &str,
+) -> Result<Uuid, (StatusCode, String)> {
+    let mut tx = pool.begin().await.map_err(internal)?;
+    let row: Option<(String, String, i64)> = sqlx::query_as(
+        "DELETE FROM pending_regs WHERE reg_code = $1 AND expires_at > now() \
+         RETURNING username, pass_hash, reg_seq",
     )
-    .bind(&req.reg_code)
+    .bind(reg_code)
     .fetch_optional(&mut *tx)
-    .await?;
-    let Some((member_openid, status, locked_username)) = row else {
-        return Err(ApiError::not_found("校验码无效或已过期，请重新申请"));
+    .await
+    .map_err(internal)?;
+    let Some((username, pass_hash, reg_seq)) = row else {
+        return Err((StatusCode::NOT_FOUND, "校验码无效或已过期，请重新申请".into()));
     };
-    // username 必须与申请时锁存的一致（防拿别人的码换名建号）
-    if req.username != locked_username {
-        return Err(ApiError::bad_request(
-            "用户名与申请时不一致，请使用申请时的用户名",
-        ));
-    }
-    if status != "verified" || member_openid.is_none() {
-        return Err(ApiError::bad_request(
-            "该码尚未在 CAMDA 群完成校验，请先在群内发送校验消息",
-        ));
-    }
-    let openid = member_openid.unwrap();
     if sqlx::query_scalar::<_, i64>("SELECT count(*) FROM users WHERE member_openid = $1")
-        .bind(&openid)
+        .bind(member_openid)
         .fetch_one(&mut *tx)
-        .await?
+        .await
+        .map_err(internal)?
         > 0
     {
-        return Err(ApiError::conflict("该 QQ 身份已绑定过账号，不允许重复注册"));
+        return Err((
+            StatusCode::CONFLICT,
+            "该 QQ 身份已绑定过账号，不允许重复注册".into(),
+        ));
     }
     let user_id = Uuid::now_v7();
-    let pass_hash = auth::hash_password(&req.password)?;
-    // 车手 ID（定案：注册顺序，从 1 起）：用 Postgres 序列发放，并发注册不重号
-    let reg_seq: i64 = sqlx::query_scalar::<_, i64>("SELECT nextval('user_reg_seq')")
-        .fetch_one(&mut *tx)
-        .await?;
     sqlx::query(
         "INSERT INTO users (id, username, pass_hash, member_openid, reg_seq) VALUES ($1,$2,$3,$4,$5)",
     )
     .bind(user_id)
-    .bind(&req.username)
+    .bind(&username)
     .bind(&pass_hash)
-    .bind(&openid)
+    .bind(member_openid)
     .bind(reg_seq)
     .execute(&mut *tx)
-    .await?;
-    let (token, token_hash) = auth::issue_token()?;
-    let expires = Utc::now() + Duration::days(auth::TOKEN_TTL_DAYS);
-    sqlx::query("INSERT INTO sessions (token_hash, user_id, expires_at) VALUES ($1,$2,$3)")
-        .bind(&token_hash)
-        .bind(user_id)
-        .bind(expires)
-        .execute(&mut *tx)
-        .await?;
-    tx.commit().await?;
-    Ok((
-        axum::http::StatusCode::CREATED,
-        Json(LoginResp {
-            token,
-            user_id,
-            username: req.username,
-            reg_seq,
-        }),
-    ))
+    .await
+    .map_err(internal)?;
+    tx.commit().await.map_err(internal)?;
+    Ok(user_id)
+}
+
+fn internal(e: sqlx::Error) -> (StatusCode, String) {
+    tracing::error!("建号事务数据库错误: {e}");
+    (StatusCode::INTERNAL_SERVER_ERROR, "服务器开小差了，请稍后再试".into())
 }
 
 #[derive(Deserialize)]
@@ -155,18 +140,21 @@ pub struct LoginResp {
     pub user_id: Uuid,
     pub username: String,
     pub reg_seq: i64,
+    /// false = 尚未设置头像（注册后首次登录），模块引导上传
+    pub has_avatar: bool,
 }
 
 pub async fn login(
     State(state): State<AppState>,
     Json(req): Json<LoginReq>,
 ) -> Result<Json<LoginResp>, ApiError> {
-    let row: Option<(Uuid, String, String, i64)> =
-        sqlx::query_as("SELECT id, pass_hash, username, reg_seq FROM users WHERE username = $1")
-            .bind(&req.username)
-            .fetch_optional(&state.pool)
-            .await?;
-    let Some((user_id, pass_hash, username, reg_seq)) = row else {
+    let row: Option<(Uuid, String, String, i64, bool)> = sqlx::query_as(
+        "SELECT id, pass_hash, username, reg_seq, (avatar_key IS NOT NULL) FROM users WHERE username = $1",
+    )
+    .bind(&req.username)
+    .fetch_optional(&state.pool)
+    .await?;
+    let Some((user_id, pass_hash, username, reg_seq, has_avatar)) = row else {
         return Err(ApiError::unauthorized("用户名或密码错误"));
     };
     if !auth::verify_password(&req.password, &pass_hash) {
@@ -185,6 +173,7 @@ pub async fn login(
         user_id,
         username,
         reg_seq,
+        has_avatar,
     }))
 }
 
@@ -324,7 +313,6 @@ impl From<anyhow::Error> for ApiError {
 pub fn router() -> Router<AppState> {
     Router::new()
         .route("/auth/register-request", post(register_request))
-        .route("/auth/register-verify", post(register_verify))
         .route("/auth/login", post(login))
         .route("/auth/reset-by-code", post(reset_by_code))
         .route("/health", get(|| async { "ok" }))
