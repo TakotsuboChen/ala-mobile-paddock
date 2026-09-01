@@ -32,6 +32,8 @@ cargo run -p paddock-api
 - 积分：`round(1 + (N−rank)×99/(N−1))`，每赛道×每版本独立，总榜跨版本累加。
 - Toast 判定在服务端事务内完成，四条件取最高。
 - 身份绑定：QQ `member_openid`（官方 bot 拿不到 QQ 号）。车手 ID = `reg_seq`（注册顺序，`user_reg_seq` 序列从 1 起）。
+- 注册流 v2（2026-09-01）：申请即设密（`register-request` 收 username+password，服务端哈希+发号存 pending_regs）→ bot 群校验成功**即建号**（回复"@用户名 校验成功…您是全服第 x 位车手"）→ 用户回模块直接登录。`register-verify` 端点已删。
+- 头像：手写 SigV4 + Garage S3（bucket `avatars`，凭据走 GARAGE_KEY_ID/GARAGE_SECRET 环境变量）；`POST/GET /v1/me/avatar` + 公开 `GET /v1/avatar/{user_id}`；榜单 entries 带 `avatar_url` 相对路径。管理端：用户改名/删除（prompt 输用户名确认）、成绩圈时编辑、时间显示北京时间。
 - bot 鉴权（QQ 官方 webhook，逐篇核对 2026-08）：鉴权头 `Authorization: QQBot {token}`（**非 Bearer**）；被动回复 msg_id 用事件 `d.id`（外层 id 是 `事件类型:` 前缀形态）；发送者身份在 `d.author.member_openid`（嵌套），C2C 用 `d.author.user_openid`；群被动窗 5min/5 次、单聊 60min/4 次；token 获取 `POST https://bots.qq.com/app/getAppAccessToken`。
 
 ## License
