@@ -241,6 +241,63 @@ pub async fn reset_by_code(
     Ok(axum::http::StatusCode::NO_CONTENT)
 }
 
+// ---- 个人资料（GET /v1/me）：模块重进后恢复登录态 + 计时赛积分 ----
+
+#[derive(Serialize)]
+pub struct MeResp {
+    pub user_id: Uuid,
+    pub username: String,
+    pub reg_seq: i64,
+    pub has_avatar: bool,
+    /// 计时赛总积分（与总榜同口径：跨版本 best-of-best 每赛道积分求和；无成绩=0）
+    pub total_points: i64,
+}
+
+/// GET /v1/me（Bearer）。模块进程重进时经此恢复 username/reg_seq/积分——
+/// token 只证明身份，profile 必须另拉；401 = token 失效（模块端自动登出）。
+pub async fn me(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+) -> Result<Json<MeResp>, ApiError> {
+    let user_id = crate::api::laps::authenticate(&state, &headers).await?;
+    let row: Option<(String, i64, bool)> = sqlx::query_as(
+        "SELECT username, reg_seq, (avatar_key IS NOT NULL) FROM users WHERE id = $1",
+    )
+    .bind(user_id)
+    .fetch_optional(&state.pool)
+    .await?;
+    let Some((username, reg_seq, has_avatar)) = row else {
+        return Err(ApiError::unauthorized("账号不存在，请重新登录"));
+    };
+    // 积分口径与 leaderboard::points_board 总榜分支一致（复制 CTE 加 user 过滤）
+    let total_points: i64 = sqlx::query_scalar(
+        r#"WITH user_best AS (
+             SELECT user_id, gp_index, min(lap_ms) AS lap_ms
+             FROM best_laps GROUP BY user_id, gp_index
+           ),
+           per_track AS (
+             SELECT user_id, lap_ms,
+                    rank() OVER (PARTITION BY gp_index ORDER BY lap_ms ASC) AS rank_in_track,
+                    count(*) OVER (PARTITION BY gp_index) AS n_in_track
+             FROM user_best WHERE user_id = $1
+           )
+           SELECT coalesce(sum(CASE WHEN n_in_track = 1 THEN 100
+                                    ELSE round(1 + (n_in_track - rank_in_track)::numeric * 99 / (n_in_track - 1))
+                               END), 0)::bigint
+           FROM per_track"#,
+    )
+    .bind(user_id)
+    .fetch_one(&state.pool)
+    .await?;
+    Ok(Json(MeResp {
+        user_id,
+        username,
+        reg_seq,
+        has_avatar,
+        total_points,
+    }))
+}
+
 async fn user_exists(pool: &PgPool, username: &str) -> Result<bool, ApiError> {
     Ok(
         sqlx::query_scalar::<_, i64>("SELECT count(*) FROM users WHERE username = $1")
@@ -315,5 +372,6 @@ pub fn router() -> Router<AppState> {
         .route("/auth/register-request", post(register_request))
         .route("/auth/login", post(login))
         .route("/auth/reset-by-code", post(reset_by_code))
+        .route("/me", get(me))
         .route("/health", get(|| async { "ok" }))
 }
