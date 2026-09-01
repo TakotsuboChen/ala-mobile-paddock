@@ -5,15 +5,27 @@
 {% for u in users %}
 <tr>
   <td class="code">{{ u.reg_seq }}</td>
-  <td>{{ u.username }}</td>
+  <td>
+    <form class="inline" method="post" action="/admin/users/{{ u.id }}/rename"
+          onsubmit="return confirm('把用户名从 {{ u.username }} 改为输入的新名字？')">
+      <input name="new_username" value="{{ u.username }}" required style="width:120px">
+      <button class="btn">改名</button>
+    </form>
+  </td>
   <td class="code">{% if u.member_openid.is_empty() %}<i style="color:#777">未绑定</i>{% else %}{{ u.member_openid }}{% endif %}</td>
   <td>{{ u.best_count }}</td>
   <td>{{ u.created }}</td>
   <td>
     <form class="inline" method="post" action="/admin/users/{{ u.id }}/reset-password"
           onsubmit="return confirm('把 {{ u.username }} 的密码重置为输入的新密码？')">
-      <input name="new_password" placeholder="新密码" required style="width:150px">
+      <input name="new_password" placeholder="新密码" required style="width:110px">
       <button class="btn">重置密码</button>
+    </form>
+    <form class="inline" method="post" action="/admin/users/{{ u.id }}/delete"
+          onsubmit="var t=prompt('删除用户 {{ u.username }} 及其全部成绩与登录态！此操作不可撤销。\n如确认删除，请输入用户名 {{ u.username }}：');if(t===null)return false;this.confirm.value=t;return t==='{{ u.username }}';">
+      <input type="hidden" name="username" value="{{ u.username }}">
+      <input type="hidden" name="confirm" value="">
+      <button class="btn danger" onclick="event.preventDefault();this.form.requestSubmit()">删除用户</button>
     </form>
   </td>
 </tr>

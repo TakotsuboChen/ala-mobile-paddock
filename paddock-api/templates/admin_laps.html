@@ -12,7 +12,14 @@
   <td>{{ l.username }}</td>
   <td>{{ l.track }}</td>
   <td class="code">{{ l.version_code }}</td>
-  <td class="code">{{ l.lap_display }}</td>
+  <td class="code">
+    <form class="inline" method="post" action="/admin/laps/{{ l.id }}/edit"
+          onsubmit="return confirm('圈时按毫秒修改（1:15.705 = 75705），改后自动重算榜单/纪录。确认？')">
+      <input name="lap_ms" value="{{ l.lap_ms_raw }}" style="width:80px" required>
+      <button class="btn">改</button>
+    </form>
+    {{ l.lap_display }}
+  </td>
   <td>
     <form class="inline" method="post" action="/admin/laps/{{ l.id }}/delete"
           onsubmit="return confirm('删除该圈并重算榜单/纪录？')">
