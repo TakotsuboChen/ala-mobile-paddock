@@ -9,6 +9,11 @@ services:
       DATABASE_URL: postgres://paddock:${POSTGRES_PASSWORD}@postgres:5432/paddock
       BIND_ADDR: 0.0.0.0:8080
       RUST_LOG: paddock_api=info,tower_http=warn
+      # 头像对象存储（Garage S3）：key/bucket 初始化见 README 部署章节；
+      # 未配置时头像上传返回 503（其余功能不受影响）。
+      GARAGE_ENDPOINT: ${GARAGE_ENDPOINT:-http://garage:3900}
+      GARAGE_KEY_ID: ${GARAGE_KEY_ID:-}
+      GARAGE_SECRET: ${GARAGE_SECRET:-}
     depends_on:
       postgres:
         condition: service_healthy
