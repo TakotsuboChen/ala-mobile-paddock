@@ -737,6 +737,11 @@ async fn handle_group_message(state: &App, event_id: &str, d: &Value) {
     let normalized = content.replace('＃', "#");
     let rules = load_rules(&state.pool).await;
     let qq_name = msg.qq_name();
+    crate::applog::log_event(
+        &state.pool, "info", "bot", "group_msg", &qq_name,
+        format!("群消息：{content}"),
+        json!({"group": msg.group_openid}),
+    );
     for r in rules.iter().filter(|r| r.enabled && r.kind == "reply") {
         if !rule_matches(r, &normalized, "") {
             continue;
@@ -879,6 +884,11 @@ async fn handle_reg_code(
                             .fetch_one(&state.pool)
                             .await
                             .unwrap_or(0);
+                            crate::applog::log_event(
+                                &state.pool, "info", "auth", "user_register", &username,
+                                format!("注册成功：{username}（车手 ID {reg_seq}，经群内校验码建号）"),
+                                json!({"reg_seq": reg_seq, "code": code}),
+                            );
                             let vars = ReplyVars {
                                 qq_name: qq_name.to_string(),
                                 paddock_name: username,
@@ -929,6 +939,11 @@ async fn handle_reset_password(
         .unwrap_or_default();
     let reply = match auth_handlers::create_reset_code(&state.pool, &name).await {
         Ok(code) => {
+            crate::applog::log_event(
+                &state.pool, "info", "auth", "reset_code_issued", &name,
+                format!("签发密码重置码（群内申请，30 分钟有效）"),
+                json!({}),
+            );
             let vars = ReplyVars {
                 qq_name: qq_name.to_string(),
                 paddock_name: name.clone(),
@@ -1061,6 +1076,15 @@ pub enum Scene {
     C2c,
 }
 
+impl Scene {
+    fn scene_str(self) -> &'static str {
+        match self {
+            Scene::Group => "群",
+            Scene::C2c => "单聊",
+        }
+    }
+}
+
 /// 启动 bot 发送队列 worker。凭据从 configs 表动态读取（管理端改配置无需重启）。
 pub fn run_sender(pool: PgPool, mut rx: mpsc::Receiver<SendJob>) {
     tokio::spawn(async move {
@@ -1167,9 +1191,19 @@ async fn send_message(pool: &PgPool, job: &SendJob, group: bool) -> anyhow::Resu
     let status = res.status();
     let body: Value = res.json().await.unwrap_or(Value::Null);
     if !status.is_success() {
+        crate::applog::log_event(
+            pool, "error", "bot", "send_failed", "bot",
+            format!("消息发送失败 {status}（{}）", job.scene.scene_str()),
+            json!({"content": job.content, "target": job.target_openid, "resp": body}),
+        );
         anyhow::bail!("QQ API {status}: {body}");
     }
     tracing::info!("[qq_bot] 消息已发送 → {body}");
+    crate::applog::log_event(
+        pool, "info", "bot", "send", "bot",
+        format!("{}: {}", if job.msg_id.is_empty() { "主动播报" } else { "回复" }, job.content),
+        json!({"target": job.target_openid}),
+    );
     Ok(())
 }
 

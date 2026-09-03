@@ -69,6 +69,11 @@ pub async fn register_request(
     .bind(expires)
     .execute(&state.pool)
     .await?;
+    crate::applog::log_event(
+        &state.pool, "info", "auth", "register_request", &req.username,
+        format!("申请注册（校验码 {reg_code}，车手 ID {reg_seq}）"),
+        serde_json::json!({"reg_seq": reg_seq}),
+    );
     Ok(Json(RegisterRequestResp {
         message_hint: format!("申请围场通行证#{reg_code}"),
         reg_code,
@@ -155,9 +160,17 @@ pub async fn login(
     .fetch_optional(&state.pool)
     .await?;
     let Some((user_id, pass_hash, username, reg_seq, has_avatar)) = row else {
+        crate::applog::log_event(
+            &state.pool, "warn", "auth", "login_failed", &req.username,
+            "登录失败（用户名不存在）", serde_json::json!({}),
+        );
         return Err(ApiError::unauthorized("用户名或密码错误"));
     };
     if !auth::verify_password(&req.password, &pass_hash) {
+        crate::applog::log_event(
+            &state.pool, "warn", "auth", "login_failed", &username,
+            "登录失败（密码错误）", serde_json::json!({}),
+        );
         return Err(ApiError::unauthorized("用户名或密码错误"));
     }
     let (token, token_hash) = auth::issue_token()?;
@@ -168,6 +181,10 @@ pub async fn login(
         .bind(expires)
         .execute(&state.pool)
         .await?;
+    crate::applog::log_event(
+        &state.pool, "info", "auth", "login", &username,
+        "登录成功", serde_json::json!({}),
+    );
     Ok(Json(LoginResp {
         token,
         user_id,
@@ -237,6 +254,10 @@ pub async fn reset_by_code(
         .bind(user_id)
         .execute(&mut *tx)
         .await?;
+    crate::applog::log_event_tx(
+        &mut tx, "info", "auth", "reset_by_code", &req.reset_code,
+        "密码重置成功（旧登录态全部失效）", serde_json::json!({}),
+    ).await;
     tx.commit().await?;
     Ok(axum::http::StatusCode::NO_CONTENT)
 }

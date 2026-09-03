@@ -54,6 +54,11 @@
   .pager select{padding:.25rem .4rem;border:1px solid #444;border-radius:6px;background:#2a2a2c;color:#eee}
   .pager button{padding:.2rem .6rem}
   .pager .cur{color:#fff;font-weight:bold}
+  /* ---- 日志级别徽章 ---- */
+  .lvl{display:inline-block;padding:.1rem .5rem;border-radius:4px;font-size:.78rem;font-family:ui-monospace,monospace}
+  .lvl-info{background:#234;color:#9cf}
+  .lvl-warn{background:#442;color:#dc6}
+  .lvl-error{background:#422;color:#f99}
 </style>
 </head>
 <body>
@@ -61,6 +66,7 @@
   <span class="brand">{{ logo_html | safe }} {{ site_title }}</span>
   <a href="/admin/users" class="{% if active == "users" %}active{% endif %}">用户</a>
   <a href="/admin/laps" class="{% if active == "laps" %}active{% endif %}">成绩</a>
+  <a href="/admin/logs" class="{% if active == "logs" %}active{% endif %}">日志</a>
   <a href="/admin/settings" class="{% if active == "settings" %}active{% endif %}">设置</a>
   <span class="spacer"></span>
   <form class="inline" method="post" action="/admin/logout"><button class="btn">退出</button></form>

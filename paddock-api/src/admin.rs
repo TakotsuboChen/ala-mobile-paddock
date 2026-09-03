@@ -318,6 +318,10 @@ async fn login_submit(State(state): State<App>, axum::Form(f): axum::Form<LoginF
         .map(|(h,)| crate::auth::verify_password(&f.password, &h))
         .unwrap_or(false);
     if !ok {
+        crate::applog::log_event(
+            &state.pool, "warn", "admin", "admin_login_failed", &f.username,
+            "管理端登录失败（用户名或密码错误）", json!({}),
+        );
         let (site_title, site_logo) = brand(&state.pool).await;
         let t = LoginTemplate {
             site_title,
@@ -329,6 +333,10 @@ async fn login_submit(State(state): State<App>, axum::Form(f): axum::Form<LoginF
         return html_res(StatusCode::UNAUTHORIZED, t.render().unwrap());
     }
     let (raw, hash) = crate::auth::issue_token().unwrap();
+    crate::applog::log_event(
+        &state.pool, "info", "admin", "admin_login", &f.username,
+        "管理端登录成功", json!({}),
+    );
     sqlx::query("INSERT INTO admin_sessions (token_hash, expires_at) VALUES ($1,$2)")
         .bind(&hash)
         .bind(Utc::now() + Duration::hours(12))
@@ -459,6 +467,163 @@ async fn laps_page(
     html_res(StatusCode::OK, t.render().unwrap())
 }
 
+// ---------- 日志页 ----------
+
+#[derive(Template)]
+#[template(path = "admin_logs.html")]
+struct LogsTemplate {
+    rows: Vec<LogRow>,
+    q: String,
+    q_json: String,
+    level: String,
+    cat: String,
+    page: i64,
+    size: i64,
+    pages: i64,
+}
+
+struct LogRow {
+    created: String,
+    level: String,
+    cat_display: String,
+    actor: String,
+    event: String,
+    message: String,
+}
+
+/// 日志页查询参数：level/cat 筛选 + 通用 q（actor/message LIKE）。
+#[derive(Deserialize)]
+struct LogQuery {
+    #[serde(default)]
+    q: String,
+    #[serde(default)]
+    level: String,
+    #[serde(default)]
+    cat: String,
+    #[serde(default = "default_page")]
+    page: i64,
+    #[serde(default = "default_size")]
+    size: i64,
+}
+
+fn cat_display(cat: &str) -> &'static str {
+    match cat {
+        "admin" => "管理端",
+        "auth" => "认证",
+        "lap" => "成绩",
+        "bot" => "Bot",
+        _ => "其他",
+    }
+}
+
+/// 日志页查询（三段筛选全部可选）。level/cat 值由调用方白名单校验后传入；
+/// q 做 actor/message/event 的 LIKE 匹配。返回 (行, 总数)。
+async fn fetch_logs(
+    pool: &PgPool,
+    q: &str,
+    level: &str,
+    cat: &str,
+    size: i64,
+    offset: i64,
+) -> (Vec<LogRow>, i64) {
+    let like = format!("%{q}%");
+    let total: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM app_logs \
+         WHERE (actor LIKE $1 OR message LIKE $1 OR event LIKE $1) \
+           AND ($2 = '' OR level = $2) AND ($3 = '' OR category = $3)",
+    )
+    .bind(&like)
+    .bind(level)
+    .bind(cat)
+    .fetch_one(pool)
+    .await
+    .unwrap_or(0);
+    let rows: Vec<(chrono::DateTime<Utc>, String, String, String, String, String)> = sqlx::query_as(
+        "SELECT created_at, level, category, actor, event, message FROM app_logs \
+         WHERE (actor LIKE $1 OR message LIKE $1 OR event LIKE $1) \
+           AND ($2 = '' OR level = $2) AND ($3 = '' OR category = $3) \
+         ORDER BY id DESC LIMIT $4 OFFSET $5",
+    )
+    .bind(&like)
+    .bind(level)
+    .bind(cat)
+    .bind(size)
+    .bind(offset)
+    .fetch_all(pool)
+    .await
+    .unwrap_or_default();
+    let rows = rows
+        .into_iter()
+        .map(|(created, level, cat, actor, event, message)| LogRow {
+            created: bj_time(created).format("%Y-%m-%d %H:%M:%S").to_string(),
+            level,
+            cat_display: cat_display(&cat).to_string(),
+            actor,
+            event,
+            message,
+        })
+        .collect();
+    (rows, total)
+}
+
+async fn logs_page(
+    State(state): State<App>,
+    headers: HeaderMap,
+    Query(mut lq): Query<LogQuery>,
+) -> Response {
+    if require_admin(&state, &headers).await.is_none() {
+        return Redirect::to("/admin").into_response();
+    }
+    if !["info", "warn", "error"].contains(&lq.level.as_str()) {
+        lq.level.clear();
+    }
+    if !["admin", "auth", "lap", "bot"].contains(&lq.cat.as_str()) {
+        lq.cat.clear();
+    }
+    // 页码收敛（size 白名单 + page 边界）需先拿总数——与用户/成绩页同节奏
+    let like = format!("%{}%", lq.q);
+    let total: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM app_logs \
+         WHERE (actor LIKE $1 OR message LIKE $1 OR event LIKE $1) \
+           AND ($2 = '' OR level = $2) AND ($3 = '' OR category = $3)",
+    )
+    .bind(&like)
+    .bind(&lq.level)
+    .bind(&lq.cat)
+    .fetch_one(&state.pool)
+    .await
+    .unwrap_or(0);
+    let mut pq = PageQuery { q: lq.q.clone(), page: lq.page, size: lq.size };
+    clamp_page(&mut pq, total);
+    let (rows, _) = fetch_logs(
+        &state.pool, &lq.q, &lq.level, &lq.cat, pq.size, (pq.page - 1) * pq.size,
+    )
+    .await;
+    let q_json = serde_json::to_string(&lq.q).unwrap_or_else(|_| "\"\"".into());
+    let body = LogsTemplate {
+        rows,
+        q: lq.q.clone(),
+        q_json,
+        level: lq.level.clone(),
+        cat: lq.cat.clone(),
+        page: pq.page,
+        size: pq.size,
+        pages: ((total + pq.size - 1) / pq.size).max(1),
+    }
+    .render()
+    .unwrap();
+    let (site_title, site_logo) = brand(&state.pool).await;
+    let t = DashTemplate {
+        title: "日志",
+        active: "logs",
+        favicon_href: favicon_href(&site_logo),
+        logo_html: logo_html(&site_logo),
+        site_title,
+        content: body,
+    };
+    html_res(StatusCode::OK, t.render().unwrap())
+}
+
 // ---------- 用户 API（JSON，页内弹窗调用） ----------
 
 #[derive(Deserialize)]
@@ -500,14 +665,11 @@ async fn api_rename_user(
         .map(|r| r.rows_affected())
         .unwrap_or(0);
     if n > 0 {
-        sqlx::query(
-            "INSERT INTO admin_audit (admin_user, action, detail) VALUES ($1,'rename_user',$2)",
-        )
-        .bind(&admin)
-        .bind(json!({"user_id": user_id.to_string(), "new_username": new_name}))
-        .execute(&mut *tx)
-        .await
-        .ok();
+        crate::applog::log_event_tx(
+            &mut tx, "info", "admin", "rename_user", &admin,
+            format!("重命名用户 → {new_name}"),
+            json!({"user_id": user_id.to_string(), "new_username": new_name}),
+        ).await;
         tx.commit().await.ok();
         api_res(true, format!("用户名已改为 {new_name}（该用户需用新名登录）"))
     } else {
@@ -556,12 +718,11 @@ async fn api_reset_password(
         .execute(&mut *tx)
         .await
         .ok();
-    sqlx::query("INSERT INTO admin_audit (admin_user, action, detail) VALUES ($1,'reset_password',$2)")
-        .bind(&admin)
-        .bind(json!({"user_id": user_id.to_string()}))
-        .execute(&mut *tx)
-        .await
-        .ok();
+    crate::applog::log_event_tx(
+        &mut tx, "info", "admin", "reset_password", &admin,
+        "重置用户密码（该用户全部登录已失效）",
+        json!({"user_id": user_id.to_string()}),
+    ).await;
     tx.commit().await.ok();
     api_res(true, "密码已重置（该用户所有登录已失效）")
 }
@@ -642,13 +803,11 @@ async fn delete_user_recalc(pool: &PgPool, user_id: Uuid, admin: &str) -> anyhow
         apply_record(&mut tx, *gp, "alltime", 0, va).await?;
         apply_record(&mut tx, *gp, "version", *ver, vb).await?;
     }
-    sqlx::query(
-        "INSERT INTO admin_audit (admin_user, action, detail) VALUES ($1,'delete_user',$2)",
-    )
-    .bind(admin)
-    .bind(json!({"user_id": user_id.to_string(), "username": name}))
-    .execute(&mut *tx)
-    .await?;
+    crate::applog::log_event_tx(
+        &mut tx, "warn", "admin", "delete_user", admin,
+        format!("删除用户 {name}（成绩与登录态一并清除，纪录已重算）"),
+        json!({"user_id": user_id.to_string(), "username": name}),
+    ).await;
     tx.commit().await?;
     Ok(name)
 }
@@ -769,12 +928,11 @@ async fn api_add_lap(
     if let Err(e) = recalc_dims(&mut tx, user_id, f.gp_index, 200146).await {
         return api_res(false, format!("重算失败：{e}"));
     }
-    sqlx::query("INSERT INTO admin_audit (admin_user, action, detail) VALUES ($1,'add_lap',$2)")
-        .bind(&admin)
-        .bind(json!({"username": username, "gp": f.gp_index, "lap_ms": lap_ms}))
-        .execute(&mut *tx)
-        .await
-        .ok();
+    crate::applog::log_event_tx(
+        &mut tx, "info", "admin", "add_lap", &admin,
+        format!("补录成绩：{username} · {} · {}", track_display_name(f.gp_index), crate::api::leaderboard::format_lap_ms(lap_ms)),
+        json!({"username": username, "gp": f.gp_index, "lap_ms": lap_ms}),
+    ).await;
     tx.commit().await.ok();
     // 补录成绩若刷新纪录同样播报（与模块上传同链路）
     crate::qq_bot::broadcast_lap_change(&state, f.gp_index, 200146, lap_ms).await;
@@ -813,13 +971,12 @@ async fn recalc_delete(pool: &PgPool, lap_id: Uuid, admin: &str) -> anyhow::Resu
         .execute(&mut *tx)
         .await
         .ok();
-    sqlx::query(
-        "INSERT INTO admin_audit (admin_user, action, detail) VALUES ($1,'delete_lap', $2)",
+    crate::applog::log_event_tx(
+        &mut tx, "warn", "admin", "delete_lap", admin,
+        format!("删除成绩（赛道 {gp} · 版本 {ver}，纪录已重算）"),
+        json!({"lap_id": lap_id.to_string(), "gp": gp, "ver": ver}),
     )
-    .bind(admin)
-    .bind(json!({"lap_id": lap_id, "gp": gp, "ver": ver}))
-    .execute(&mut *tx)
-    .await?;
+    .await;
     tx.commit().await?;
     Ok(Some((gp, ver, before_alltime, before_version)))
 }
@@ -849,13 +1006,12 @@ async fn recalc_edit(pool: &PgPool, lap_id: Uuid, new_ms: i32, admin: &str) -> a
         .execute(&mut *tx)
         .await
         .ok();
-    sqlx::query(
-        "INSERT INTO admin_audit (admin_user, action, detail) VALUES ($1,'edit_lap', $2)",
+    crate::applog::log_event_tx(
+        &mut tx, "info", "admin", "edit_lap", admin,
+        format!("修改成绩圈时 → {}（赛道 {gp} · 版本 {ver}，纪录已重算）", crate::api::leaderboard::format_lap_ms(new_ms)),
+        json!({"lap_id": lap_id.to_string(), "new_ms": new_ms}),
     )
-    .bind(admin)
-    .bind(json!({"lap_id": lap_id, "new_ms": new_ms}))
-    .execute(&mut *tx)
-    .await?;
+    .await;
     tx.commit().await?;
     Ok(Some((gp, ver)))
 }
@@ -1319,12 +1475,24 @@ async fn api_save_brand(
 }
 
 async fn audit(pool: &PgPool, action: &str, detail: serde_json::Value) {
-    sqlx::query("INSERT INTO admin_audit (admin_user, action, detail) VALUES ('admin',$1,$2)")
-        .bind(action)
-        .bind(detail)
-        .execute(pool)
-        .await
-        .ok();
+    crate::applog::log_event(
+        pool, "info", "admin", action, "admin",
+        action_message(action, &detail),
+        detail,
+    );
+}
+
+/// audit() 兼容层：action → 人类可读摘要（旧 admin_audit 调用点全部转 applog）。
+fn action_message(action: &str, detail: &serde_json::Value) -> String {
+    match action {
+        "change_admin_password" => "修改管理员密码（全部管理端会话已作废）".into(),
+        "change_admin_username" => format!("修改管理员用户名 → {}", detail["new"].as_str().unwrap_or("")),
+        "save_bot_config" => format!("保存 bot 配置（app_id={}) ", detail["app_id"].as_str().unwrap_or("")),
+        "save_bot_rules" => format!("保存消息规则（{} 条）", detail["count"]),
+        "save_broadcast_groups" => format!("保存播报目标群（{} 个）", detail["count"]),
+        "save_brand" => format!("保存品牌配置（站点名：{}）", detail["site_title"].as_str().unwrap_or("")),
+        other => other.to_string(),
+    }
 }
 
 /// JSON 端点的路径提取器：UUID 解析失败统一 404 JSON（前端 fetch 不会走浏览器跳转）。
@@ -1356,6 +1524,7 @@ pub fn router() -> Router<App> {
         .route("/logout", post(logout))
         .route("/users", get(users_page))
         .route("/laps", get(laps_page))
+        .route("/logs", get(logs_page))
         .route("/settings", get(settings_page))
         // 用户 API
         .route("/api/users/{id}/rename", post(api_rename_user))

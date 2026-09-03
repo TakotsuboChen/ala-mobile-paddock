@@ -4,6 +4,7 @@
 
 mod admin;
 mod api;
+mod applog;
 mod auth;
 mod qq_bot;
 mod state;
@@ -33,6 +34,7 @@ async fn main() -> anyhow::Result<()> {
         .run(&pool)
         .await
         .context("执行数据库迁移失败")?;
+    applog::purge_expired(&pool).await; // 90 天保留：启动时清一次过期日志
 
     // bot 发送队列：凭据由管理端设置页动态配置，worker 出队时实时读取，无需重启
     let (bot_tx, bot_rx) = tokio::sync::mpsc::channel(64);

@@ -1,0 +1,47 @@
+<h2>日志</h2>
+<form method="get" action="/admin/logs" style="margin-bottom:.8rem;display:flex;gap:.6rem;align-items:center;flex-wrap:wrap">
+  <select name="level" style="padding:.4rem;border-radius:6px;border:1px solid #444;background:#2a2a2c;color:#eee">
+    <option value="">全部级别</option>
+    <option value="info" {% if level == "info" %}selected{% endif %}>info</option>
+    <option value="warn" {% if level == "warn" %}selected{% endif %}>warn</option>
+    <option value="error" {% if level == "error" %}selected{% endif %}>error</option>
+  </select>
+  <select name="cat" style="padding:.4rem;border-radius:6px;border:1px solid #444;background:#2a2a2c;color:#eee">
+    <option value="">全部分类</option>
+    <option value="admin" {% if cat == "admin" %}selected{% endif %}>管理端</option>
+    <option value="auth" {% if cat == "auth" %}selected{% endif %}>认证</option>
+    <option value="lap" {% if cat == "lap" %}selected{% endif %}>成绩</option>
+    <option value="bot" {% if cat == "bot" %}selected{% endif %}>Bot</option>
+  </select>
+  <input name="q" value="{{ q }}" placeholder="搜索消息/操作者" style="padding:.4rem;border-radius:6px;border:1px solid #444;background:#2a2a2c;color:#eee">
+  <button class="btn">筛选</button>
+</form>
+<table id="log-table">
+<tr><th>时间</th><th>级别</th><th>分类</th><th>操作者</th><th>事件</th><th>消息</th></tr>
+{% for l in rows %}
+<tr>
+  <td class="code">{{ l.created }}</td>
+  <td><span class="lvl lvl-{{ l.level }}">{{ l.level }}</span></td>
+  <td>{{ l.cat_display }}</td>
+  <td>{{ l.actor }}</td>
+  <td class="code">{{ l.event }}</td>
+  <td style="white-space:normal">{{ l.message }}</td>
+</tr>
+{% endfor %}
+{% if rows.is_empty() %}<tr><td colspan="6" style="color:#777;white-space:normal">无日志（当前筛选条件下）</td></tr>{% endif %}
+</table>
+<div class="pager" id="log-pager"></div>
+<script>
+const P = { page: {{ page }}, pages: {{ pages }}, size: {{ size }}, q: {{ q_json | safe }}, level: "{{ level }}", cat: "{{ cat }}" };
+function goPage(p, s){
+  const params = new URLSearchParams();
+  if(P.q) params.set('q', P.q);
+  if(P.level) params.set('level', P.level);
+  if(P.cat) params.set('cat', P.cat);
+  params.set('page', p);
+  params.set('size', s);
+  location.href = `/admin/logs?${params.toString()}`;
+}
+renderPager(document.getElementById('log-pager'), P.page, P.pages, P.size,
+  (p,s)=>goPage(p,s), s=>goPage(1,s));
+</script>

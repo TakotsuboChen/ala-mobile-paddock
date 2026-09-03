@@ -200,6 +200,32 @@ pub async fn upload_lap(
 
     tx.commit().await?;
 
+    // 高频事件降采样：普通圈不入日志，只有破纪录（个人/全服任一维度）才记，
+    // 防止 app_logs 被 205 人的每一圈刷爆（保留策略 90 天也扛不住全量）。
+    if toast.is_some() {
+        let (username,) = sqlx::query_as::<_, (String,)>("SELECT username FROM users WHERE id=$1")
+            .bind(user_id)
+            .fetch_one(&state.pool)
+            .await
+            .unwrap_or((String::new(),));
+        crate::applog::log_event(
+            &state.pool, "info", "lap", "lap_record", &username,
+            format!(
+                "{} 刷新{}纪录：{} · {}",
+                username,
+                match toast.as_ref().unwrap().level {
+                    "alltime_server" => "全服历史",
+                    "version_server" => "全服版本",
+                    "alltime_personal" => "个人历史",
+                    _ => "个人版本",
+                },
+                track_display_name(lap.gp_index),
+                crate::api::leaderboard::format_lap_ms(lap.lap_ms),
+            ),
+            serde_json::json!({"gp": lap.gp_index, "lap_ms": lap.lap_ms, "toast_level": toast.as_ref().unwrap().level}),
+        );
+    }
+
     // 全服纪录播报（事务外）：两事件分立，历史优先于版本；失败不影响上传
     if server_best {
         crate::qq_bot::broadcast_lap_change(&state, lap.gp_index, lap.version_code, lap.lap_ms).await;
