@@ -84,10 +84,12 @@ function runPoll(){
       if(j.lines.length){
         // 多行 payload（如 payload 原文含换行）逐行入 <pre>，级别 token 着色
         const frag = document.createDocumentFragment();
-        for(const line of j.lines){
+        for(let i = 0; i < j.lines.length; i++){
+          const line = j.lines[i];
           const div = document.createElement('div');
           // tracing fmt 级别 token：` INFO ` / ` WARN ` / `ERROR`（无方括号，按词匹配）
-          div.className = /\bERROR\b/.test(line) ? 'rl-err' : /\bWARN\b/.test(line) ? 'rl-warn' : '';
+          div.className = (/\bERROR\b/.test(line) ? 'rl-err' : /\bWARN\b/.test(line) ? 'rl-warn' : '')
+            + ((runLast + i + 1) % 2 ? '' : ' rl-even'); // 斑马纹：全局序号奇偶，跨批次也稳定交替
           div.textContent = line;
           frag.appendChild(div);
         }
