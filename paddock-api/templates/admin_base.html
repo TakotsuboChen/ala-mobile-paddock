@@ -69,9 +69,12 @@
   .rundot.ok{background:#4c4;box-shadow:0 0 4px #4c4}
   .rundot.bad{background:#c44}
   .runterm{background:#0d0d0f;border:1px solid #333;border-radius:0 0 8px 8px;color:#c8e1c8;font-family:ui-monospace,'Cascadia Mono','Source Code Pro',monospace;font-size:.8rem;line-height:1.45;padding:.7rem .9rem;height:70vh;overflow-y:auto;margin:0;white-space:pre-wrap;word-break:break-all;scrollbar-width:thin;scrollbar-color:#444 #0d0d0f}
+  /* 斑马纹=文字颜色交替：普通行深绿，偶数行浅灰绿。⚠️ 必须在 rl-warn/rl-err 之前声明，
+     同特异性下后声明赢——否则 ERROR/WARN 行逢偶数被斑马色覆盖 */
+  .runterm{color:#8fbf8f}
+  .runterm .rl-even{color:#c4d6c4}
   .runterm .rl-warn{color:#f4c542}
   .runterm .rl-err{color:#ff6b6b}
-  .runterm .rl-even{background:rgba(255,255,255,.045)}
 </style>
 </head>
 <body>
