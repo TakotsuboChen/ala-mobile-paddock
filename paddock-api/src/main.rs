@@ -18,8 +18,11 @@ use tower_http::trace::TraceLayer;
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     // 运行日志双写：同一条格式化日志 → stdout（容器日志）+ 内存环形缓冲（管理端"运行日志"视图）
+    // with_ansi(false)：ANSI 颜色码只对 tty 有意义，进内存环/日志聚合就是乱码；
+    // Web 端着色由前端 CSS 按 WARN/ERROR 词匹配实现。
     use tracing_subscriber::fmt::writer::MakeWriterExt as _;
     tracing_subscriber::fmt()
+        .with_ansi(false)
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| "paddock_api=info,tower_http=warn".into()),
