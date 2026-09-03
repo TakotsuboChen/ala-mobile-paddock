@@ -1,4 +1,25 @@
 <h2>日志</h2>
+<div class="logtabs">
+  <button class="logtab active" id="tab-run" onclick="switchTab('run')">运行日志</button>
+  <button class="logtab" id="tab-evt" onclick="switchTab('evt')">业务事件</button>
+</div>
+
+<!-- ===== 运行日志视图：终端风，游标增量轮询 ===== -->
+<div id="view-run">
+  <div class="runbar">
+    <span class="rundot" id="run-dot"></span>
+    <span id="run-status">加载中…</span>
+    <span style="flex:1"></span>
+    <label style="display:flex;align-items:center;gap:.3rem;cursor:pointer">
+      <input type="checkbox" id="run-follow" checked>自动滚动
+    </label>
+    <button class="btn" onclick="runClearView()">清屏</button>
+  </div>
+  <pre id="runterm" class="runterm"></pre>
+</div>
+
+<!-- ===== 业务事件视图：原表格 ===== -->
+<div id="view-evt" style="display:none">
 <form method="get" action="/admin/logs" style="margin-bottom:.8rem;display:flex;gap:.6rem;align-items:center;flex-wrap:wrap">
   <select name="level" style="padding:.4rem;border-radius:6px;border:1px solid #444;background:#2a2a2c;color:#eee">
     <option value="">全部级别</option>
@@ -31,8 +52,68 @@
 {% if rows.is_empty() %}<tr><td colspan="6" style="color:#777;white-space:normal">无日志（当前筛选条件下）</td></tr>{% endif %}
 </table>
 <div class="pager" id="log-pager"></div>
+</div>
+
 <script>
+// ---- Tab 切换 ----
+function switchTab(t){
+  document.getElementById('view-run').style.display = t==='run' ? '' : 'none';
+  document.getElementById('view-evt').style.display = t==='evt' ? '' : 'none';
+  document.getElementById('tab-run').classList.toggle('active', t==='run');
+  document.getElementById('tab-evt').classList.toggle('active', t==='evt');
+  if(t==='run') runStart();
+}
+// ---- 运行日志：游标增量轮询（2s）+ 级别着色 + 自动滚底 ----
 const P = { page: {{ page }}, pages: {{ pages }}, size: {{ size }}, q: {{ q_json | safe }}, level: "{{ level }}", cat: "{{ cat }}" };
+let runTimer = null, runLast = 0, runStarted = false;
+const MAX_VIEW_LINES = 3000; // 视图上限：DOM 行数超出丢头（防长开页面内存膨胀）
+
+function runStart(){
+  if(runStarted) return;
+  runStarted = true;
+  runPoll();
+  runTimer = setInterval(runPoll, 2000);
+}
+function runPoll(){
+  fetch(`/admin/api/runtime-logs?after=${runLast}`)
+    .then(r=>r.json())
+    .then(j=>{
+      if(!j.ok){ setStatus('会话过期', false); return; }
+      const term = document.getElementById('runterm');
+      const atBottom = term.scrollHeight - term.scrollTop - term.clientHeight < 40;
+      if(j.lines.length){
+        // 多行 payload（如 payload 原文含换行）逐行入 <pre>，级别 token 着色
+        const frag = document.createDocumentFragment();
+        for(const line of j.lines){
+          const div = document.createElement('div');
+          // tracing fmt 级别 token：` INFO ` / ` WARN ` / `ERROR`（无方括号，按词匹配）
+          div.className = /\bERROR\b/.test(line) ? 'rl-err' : /\bWARN\b/.test(line) ? 'rl-warn' : '';
+          div.textContent = line;
+          frag.appendChild(div);
+        }
+        term.appendChild(frag);
+        while(term.children.length > MAX_VIEW_LINES) term.removeChild(term.firstChild);
+        runLast = j.last;
+        if(document.getElementById('run-follow').checked && atBottom) term.scrollTop = term.scrollHeight;
+        setStatus(`实时跟踪中 · 已显示 ${term.children.length} 行`, true);
+      } else {
+        setStatus('实时跟踪中 · 无新日志', true);
+      }
+    })
+    .catch(()=>setStatus('网络错误，重试中…', false));
+}
+function setStatus(txt, ok){
+  document.getElementById('run-status').textContent = txt;
+  document.getElementById('run-dot').className = 'rundot' + (ok ? ' ok' : ' bad');
+}
+function runClearView(){
+  document.getElementById('runterm').innerHTML = '';
+  runLast = 0;
+  runPoll();
+}
+// 游标重置为 0 时（清屏/首次），after=0 会从缓冲最旧开始——上面 runClearView 正确复用此语义
+
+// ---- 业务事件视图：分页条（切到该 tab 才可见） ----
 function goPage(p, s){
   const params = new URLSearchParams();
   if(P.q) params.set('q', P.q);
@@ -44,4 +125,6 @@ function goPage(p, s){
 }
 renderPager(document.getElementById('log-pager'), P.page, P.pages, P.size,
   (p,s)=>goPage(p,s), s=>goPage(1,s));
+// 默认显示运行日志 tab
+runStart();
 </script>

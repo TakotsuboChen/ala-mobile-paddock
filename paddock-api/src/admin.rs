@@ -624,6 +624,28 @@ async fn logs_page(
     html_res(StatusCode::OK, t.render().unwrap())
 }
 
+// ---------- 运行日志 API（内存环形缓冲，终端风视图） ----------
+
+/// GET /admin/api/runtime-logs?after=N：游标增量拉取运行日志行。
+/// after=0 从缓冲内最旧行开始；返回 {ok, lines, last}，last 供下一轮游标。
+async fn api_runtime_logs(
+    State(state): State<App>,
+    headers: HeaderMap,
+    Query(q): Query<RunlogQuery>,
+) -> Response {
+    if require_admin(&state, &headers).await.is_none() {
+        return api_res(false, "会话已过期，请重新登录");
+    }
+    let (lines, last) = crate::runlog::read_after(q.after.max(0) as u64);
+    Json(json!({"ok": true, "lines": lines, "last": last})).into_response()
+}
+
+#[derive(Deserialize)]
+struct RunlogQuery {
+    #[serde(default)]
+    after: i64,
+}
+
 // ---------- 用户 API（JSON，页内弹窗调用） ----------
 
 #[derive(Deserialize)]
@@ -1541,5 +1563,6 @@ pub fn router() -> Router<App> {
         .route("/api/bot/rules", post(api_save_rules))
         .route("/api/bot/groups", get(api_known_groups))
         .route("/api/bot/groups", post(api_save_broadcast_groups))
+        .route("/api/runtime-logs", get(api_runtime_logs))
         .route("/api/brand", post(api_save_brand))
 }

@@ -59,6 +59,18 @@
   .lvl-info{background:#234;color:#9cf}
   .lvl-warn{background:#442;color:#dc6}
   .lvl-error{background:#422;color:#f99}
+  /* ---- 日志页 tab ---- */
+  .logtabs{display:flex;gap:.4rem;margin-bottom:.8rem}
+  .logtab{padding:.35rem 1rem;border:1px solid #444;border-radius:8px 8px 0 0;background:#1c1c1e;color:#9ab;cursor:pointer;font-size:.92rem}
+  .logtab.active{background:#2a2a2e;color:#fff;border-bottom-color:#2a2a2e}
+  /* ---- 运行日志终端视图 ---- */
+  .runbar{display:flex;gap:.8rem;align-items:center;padding:.4rem .7rem;background:#1a1a1c;border:1px solid #333;border-bottom:0;border-radius:8px 8px 0 0;font-size:.85rem;color:#9ab}
+  .rundot{width:8px;height:8px;border-radius:50%;background:#666;display:inline-block}
+  .rundot.ok{background:#4c4;box-shadow:0 0 4px #4c4}
+  .rundot.bad{background:#c44}
+  .runterm{background:#0d0d0f;border:1px solid #333;border-radius:0 0 8px 8px;color:#c8e1c8;font-family:ui-monospace,'Cascadia Mono','Source Code Pro',monospace;font-size:.8rem;line-height:1.45;padding:.7rem .9rem;height:70vh;overflow-y:auto;margin:0;white-space:pre-wrap;word-break:break-all;scrollbar-width:thin;scrollbar-color:#444 #0d0d0f}
+  .runterm .rl-warn{color:#f4c542}
+  .runterm .rl-err{color:#ff6b6b}
 </style>
 </head>
 <body>

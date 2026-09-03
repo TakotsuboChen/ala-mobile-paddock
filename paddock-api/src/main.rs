@@ -7,6 +7,7 @@ mod api;
 mod applog;
 mod auth;
 mod qq_bot;
+mod runlog;
 mod state;
 
 use anyhow::Context;
@@ -16,10 +17,15 @@ use tower_http::trace::TraceLayer;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // 运行日志双写：同一条格式化日志 → stdout（容器日志）+ 内存环形缓冲（管理端"运行日志"视图）
+    use tracing_subscriber::fmt::writer::MakeWriterExt as _;
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| "paddock_api=info,tower_http=warn".into()),
+        )
+        .with_writer(
+            std::io::stdout.and(runlog::RuntimeLogWriter),
         )
         .init();
 
