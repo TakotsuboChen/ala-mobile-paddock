@@ -32,9 +32,11 @@ cargo run -p paddock-api
 - 积分：`round(1 + (N−rank)×99/(N−1))`，每赛道×每版本独立，总榜跨版本累加。
 - Toast 判定在服务端事务内完成，四条件取最高。
 - 身份绑定：QQ `member_openid`（官方 bot 拿不到 QQ 号）。车手 ID = `reg_seq`（注册顺序，`user_reg_seq` 序列从 1 起）。
-- 注册流 v2（2026-09-01）：申请即设密（`register-request` 收 username+password，服务端哈希+发号存 pending_regs）→ bot 群校验成功**即建号**（回复"@用户名 校验成功…您是全服第 x 位车手"）→ 用户回模块直接登录。`register-verify` 端点已删。
-- 头像：手写 SigV4 + Garage S3（bucket `avatars`，凭据走 GARAGE_KEY_ID/GARAGE_SECRET 环境变量）；`POST/GET /v1/me/avatar` + 公开 `GET /v1/avatar/{user_id}`；榜单 entries 带 `avatar_url` 相对路径。管理端：用户改名/删除（prompt 输用户名确认）、成绩圈时编辑、时间显示北京时间。
-- bot 鉴权（QQ 官方 webhook，逐篇核对 2026-08）：鉴权头 `Authorization: QQBot {token}`（**非 Bearer**）；被动回复 msg_id 用事件 `d.id`（外层 id 是 `事件类型:` 前缀形态）；发送者身份在 `d.author.member_openid`（嵌套），C2C 用 `d.author.user_openid`；群被动窗 5min/5 次、单聊 60min/4 次；token 获取 `POST https://bots.qq.com/app/getAppAccessToken`。
+- 注册流 v2（2026-09-01）：申请即设密（`register-request` 收 username+password，服务端哈希+发号存 pending_regs）→ bot 群校验成功**即建号** → 用户回模块直接登录。`register-verify` 端点已删。
+- 头像：手写 SigV4 + Garage S3（bucket `avatars`，凭据走 GARAGE_KEY_ID/GARAGE_SECRET 环境变量）；`POST/GET /v1/me/avatar` + 公开 `GET /v1/avatar/{user_id}`；榜单 entries 带 `avatar_url` 相对路径。
+- bot 鉴权（QQ 官方 webhook，逐篇核对 2026-08）：鉴权头 `Authorization: QQBot {token}`（**非 Bearer**）；被动回复 msg_id 用事件 `d.id`（外层 id 是 `事件类型:` 前缀形态）；发送者身份在 `d.author.member_openid`（嵌套），C2C 用 `d.author.user_openid`；群被动窗 5min/5 次、单聊 60min/4 次；token 获取 `POST https://bots.qq.com/app/getAppAccessToken`；群全量消息（GROUP_MESSAGE_CREATE）需**手机QQ群内**机器人设置开启「获取群内全部消息」，开放平台开关不等于群内授权；引用回复用 `message_scene.ext` 的 `msg_idx=REFIDX_`。
+- **Web 管理端 v2**（2026-09-03）：GET 页面只渲染骨架，所有写操作走 `/admin/api/*` JSON 端点 + 前端页内弹窗（自绘 modal + fetch + 局部刷新），无 URL 路径后缀式动作。品牌名/Logo（configs 表 `site_title`/`site_logo` data URL）作用于导航栏/登录页/浏览器标签页 title+favicon。消息规则引擎（configs 表 `bot_message_rules` JSON）：规则=类型（reply/broadcast）+action（reply/reg_code/reset_password）+触发词/条件（且或组合）+成功模板+每类失败独立文案，预设 4 条完整可编辑；播报事件 `record_alltime`/`record_version` 分立（历史优先），模块上传与管理端增删改成绩统一经 `broadcast_lap_change` 触发。播报目标群（`bot_broadcast_groups`）由 webhook 收到群消息自动登记（`bot_known_groups`）+ 群名缓存（`/v2/groups/{id}/info`，11253 白名单限制时回退 openid）。用户/成绩页分页（30/50/100）+ 按用户名搜索。combobox（自绘，fixed 定位防弹窗裁剪）用于用户/赛道选择，文字选择原生放行。JS 公共脚本块必须位于 `<main>`（content）**之前**——页内脚本顶层依赖 toast/varTag 等公共函数，顺序颠倒=整段脚本 ReferenceError 中断；模板 JS 改动用 jsdom 验证渲染产物。
+- 迁移注意：`sqlx::migrate!` 编译期嵌入——改/增迁移文件后必须 `touch src/main.rs` 触发重编译，否则旧二进制跑旧迁移。0005 回填 best_laps 缺行（recalc_dims 已改 upsert，管理端补录成绩的维度不再静默丢行）。
 
 ## License
 
