@@ -199,6 +199,12 @@ pub async fn upload_lap(
     }
 
     tx.commit().await?;
+
+    // 全服纪录播报（事务外）：两事件分立，历史优先于版本；失败不影响上传
+    if server_best {
+        crate::qq_bot::broadcast_lap_change(&state, lap.gp_index, lap.version_code, lap.lap_ms).await;
+    }
+
     Ok(Json(LapUploadResp {
         personal_best,
         server_best,
@@ -260,6 +266,14 @@ pub async fn authenticate(state: &AppState, headers: &HeaderMap) -> Result<Uuid,
         .execute(&state.pool)
         .await?;
     Ok(user_id)
+}
+
+/// 游戏 versionCode → 版本名（管理端展示用；新版本上市时在此追加映射）。
+pub fn version_display(version_code: i32) -> String {
+    match version_code {
+        200146 => "8.0.4".to_string(),
+        other => format!("code {other}"),
+    }
 }
 
 /// 赛道中文名（契约源头=PADDOCK_PLAN.md §5；模块侧同名表保持一致，改必须两边同改）。

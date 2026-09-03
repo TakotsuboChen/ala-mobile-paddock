@@ -3,7 +3,8 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>围场管理端 · 登录</title>
+<title>{{ site_title }}管理端 · 登录</title>
+<link rel="icon" href="{{ favicon_href }}">
 <style>
   body{font-family:system-ui,sans-serif;background:#111;color:#eee;display:flex;justify-content:center;padding-top:18vh;margin:0}
   .card{background:#1c1c1e;border-radius:12px;padding:2rem;width:320px}
@@ -15,11 +16,11 @@
 </head>
 <body>
 <div class="card">
-  <h1>🏁 围场管理端</h1>
+  <h1>{% if has_logo %}<img src="{{ site_logo_src }}" alt="" style="width:28px;height:28px;vertical-align:middle;object-fit:contain"> {% endif %}{{ site_title }}管理端</h1>
   <p class="err">{{ error }}</p>
   <form method="post" action="/admin/login">
     <input name="username" placeholder="管理员用户名" autofocus>
-    <input name="password" type="password" placeholder="密码">
+    <input name="password" type="password" placeholder="密码" autocomplete="current-password">
     <button type="submit">登录</button>
   </form>
 </div>

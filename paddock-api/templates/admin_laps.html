@@ -1,32 +1,104 @@
 <h2>成绩管理</h2>
-{% if !notice.is_empty() %}<p class="notice">{{ notice }}</p>{% endif %}
-<form method="get" action="/admin/laps" style="margin-bottom:.8rem">
-  <input name="q" value="" placeholder="按用户名筛选" style="padding:.4rem;border-radius:6px;border:1px solid #444;background:#2a2a2c;color:#eee">
+<form method="get" action="/admin/laps" style="margin-bottom:.8rem;display:flex;gap:.6rem;align-items:center">
+  <input name="q" value="{{ q }}" placeholder="按用户名筛选" style="padding:.4rem;border-radius:6px;border:1px solid #444;background:#2a2a2c;color:#eee">
   <button class="btn">筛选</button>
+  <span style="flex:1"></span>
+  <button type="button" class="btn primary" onclick="lapAdd()">添加成绩</button>
 </form>
-<table>
+<table id="lap-table">
 <tr><th>时间</th><th>用户</th><th>赛道</th><th>版本</th><th>圈时</th><th>操作</th></tr>
 {% for l in rows %}
-<tr>
+<tr data-id="{{ l.id }}" data-ms="{{ l.lap_ms_raw }}" data-user="{{ l.username }}">
   <td class="code">{{ l.created }}</td>
   <td>{{ l.username }}</td>
   <td>{{ l.track }}</td>
-  <td class="code">{{ l.version_code }}</td>
-  <td class="code">
-    <form class="inline" method="post" action="/admin/laps/{{ l.id }}/edit"
-          onsubmit="return confirm('圈时按毫秒修改（1:15.705 = 75705），改后自动重算榜单/纪录。确认？')">
-      <input name="lap_ms" value="{{ l.lap_ms_raw }}" style="width:80px" required>
-      <button class="btn">改</button>
-    </form>
-    {{ l.lap_display }}
-  </td>
+  <td class="code">{{ l.version_name }}</td>
+  <td class="code">{{ l.lap_display }}</td>
   <td>
-    <form class="inline" method="post" action="/admin/laps/{{ l.id }}/delete"
-          onsubmit="return confirm('删除该圈并重算榜单/纪录？')">
-      <button class="btn danger">删除</button>
-    </form>
+    <button class="btn" onclick="lapEdit(this.closest('tr'))">编辑</button>
+    <button class="btn danger" onclick="lapDelete(this.closest('tr'))">删除</button>
   </td>
 </tr>
 {% endfor %}
-{% if rows.is_empty() %}<tr><td colspan="6" style="color:#777">无成绩记录</td></tr>{% endif %}
+{% if rows.is_empty() %}<tr><td colspan="6" style="color:#777;white-space:normal">无成绩记录</td></tr>{% endif %}
 </table>
+<div class="pager" id="lap-pager"></div>
+<script>
+const TRACKS = {{ tracks_json | safe }};
+const USERS = {{ usernames_json | safe }};
+const P = { page: {{ page }}, pages: {{ pages }}, size: {{ size }}, q: {{ q_json | safe }} };
+function goPage(p, s){
+  const q = P.q ? `&q=${encodeURIComponent(P.q)}` : '';
+  location.href = `/admin/laps?page=${p}&size=${s}${q}`;
+}
+renderPager(document.getElementById('lap-pager'), P.page, P.pages, P.size,
+  (p,s)=>goPage(p,s), s=>goPage(1,s));
+function lapInputs(ms){
+  const [m, s, f] = ms!==undefined ? splitMs(ms) : [0,0,0];
+  return `<div class="lap-inputs">
+    <input id="m-min" type="number" min="0" max="59" value="${m}"><span>分</span>
+    <input id="m-sec" type="number" min="0" max="59" value="${s}"><span>秒</span>
+    <input id="m-ms" type="number" min="0" max="999" value="${f}"><span>毫秒</span>
+  </div>`;
+}
+function readLap(mask){
+  const min = parseInt(mask.querySelector('#m-min').value)||0;
+  const sec = parseInt(mask.querySelector('#m-sec').value)||0;
+  const ms  = parseInt(mask.querySelector('#m-ms').value)||0;
+  if(min===0 && sec===0 && ms===0) throw new Error('圈时必须大于 0');
+  return {min, sec, ms};
+}
+function lapEdit(tr){
+  const id = tr.dataset.id, ms = parseInt(tr.dataset.ms), user = tr.dataset.user;
+  openModal({
+    title: `编辑成绩 · ${user}`,
+    body: `<p class="hint">原圈时 ${tr.children[4].textContent}，改后自动重算榜单/纪录。</p>${lapInputs(ms)}`,
+    okText: '保存',
+    onOk: async (mask)=>{
+      const msg = await api(`/admin/api/laps/${id}/edit`, readLap(mask));
+      await refreshPage();
+      return msg;
+    }
+  });
+}
+function lapDelete(tr){
+  const id = tr.dataset.id, user = tr.dataset.user;
+  openModal({
+    title: `删除成绩 · ${user}`,
+    danger: true,
+    body: `<p class="hint">删除该条 ${tr.children[2].textContent} 成绩（${tr.children[4].textContent}）并重算榜单/纪录。</p>`,
+    okText: '删除',
+    onOk: async ()=>{
+      const msg = await api(`/admin/api/laps/${id}/delete`, {});
+      await refreshPage();
+      return msg;
+    }
+  });
+}
+function lapAdd(){
+  openModal({
+    title: '添加成绩',
+    body: `
+      <label>用户</label><div id="m-user"></div>
+      <label>赛道</label><div id="m-track"></div>
+      <label>圈时</label>${lapInputs()}`,
+    okText: '添加',
+    onOk: async (mask)=>{
+      const gp = parseInt(trackC.value);
+      if(isNaN(gp)) throw new Error('请先选择赛道');
+      const body = {
+        username: userC.value,
+        gp_index: gp,
+        ...readLap(mask)
+      };
+      const msg = await api('/admin/api/laps/add', body);
+      await refreshPage();
+      return msg;
+    }
+  });
+  const userC = makeCombo(document.getElementById('m-user'),
+    USERS.map(u=>({value:u, label:u})), {placeholder:'输入筛选用户…'});
+  const trackC = makeCombo(document.getElementById('m-track'),
+    TRACKS.map(([i,n])=>({value:String(i), label:n})), {placeholder:'输入或选择赛道…'});
+}
+</script>

@@ -3,36 +3,211 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>围场管理端 · {{ title }}</title>
+<title>{{ site_title }}管理端 · {{ title }}</title>
+<link rel="icon" href="{{ favicon_href }}">
 <style>
   body{font-family:system-ui,sans-serif;background:#111;color:#eee;margin:0}
   nav{display:flex;gap:1rem;align-items:center;background:#1c1c1e;padding:.7rem 1.2rem}
+  nav .brand{display:flex;align-items:center;gap:.5rem;font-weight:bold;color:#fff;text-decoration:none}
+  nav .brand img{width:22px;height:22px;object-fit:contain}
   nav a{color:#9ab;text-decoration:none;padding:.2rem .6rem;border-radius:6px}
   nav a.active{background:#2a2a2e;color:#fff}
   nav .spacer{flex:1}
-  main{max-width:960px;margin:1.5rem auto;padding:0 1rem}
+  main{max-width:1100px;margin:1.5rem auto;padding:0 1rem}
   table{width:100%;border-collapse:collapse;font-size:.92rem}
-  th,td{text-align:left;padding:.45rem .6rem;border-bottom:1px solid #2a2a2c}
+  th,td{text-align:left;padding:.45rem .6rem;border-bottom:1px solid #2a2a2c;white-space:nowrap}
   th{color:#8af}
   .btn{display:inline-block;padding:.25rem .7rem;border:0;border-radius:6px;background:#4a4a4e;color:#eee;cursor:pointer;text-decoration:none;font-size:.85rem}
   .btn.danger{background:#a33}
+  .btn.primary{background:#4c8dff}
   .notice{background:#243; color:#cfc; padding:.5rem .8rem;border-radius:8px;margin-bottom:.8rem}
   .code{font-family:ui-monospace,monospace}
   form.inline{display:inline}
+  /* ---- 页内弹窗（自绘 modal，非浏览器 confirm） ---- */
+  .modal-mask{position:fixed;inset:0;background:rgba(0,0,0,.6);display:flex;align-items:center;justify-content:center;z-index:100}
+  .modal{background:#1c1c1e;border:1px solid #333;border-radius:12px;padding:1.4rem;min-width:340px;max-width:92vw;max-height:86vh;overflow:auto}
+  .modal h3{margin:0 0 1rem;font-size:1.05rem;color:#fff}
+  .modal label{display:block;margin:.6rem 0 .2rem;color:#9ab;font-size:.88rem}
+  .modal input,.modal select{width:100%;box-sizing:border-box;padding:.5rem;border:1px solid #444;border-radius:8px;background:#2a2a2c;color:#eee;font-size:.95rem}
+  .modal .row{display:flex;gap:.6rem}
+  .modal .row>*{flex:1}
+  .modal .actions{display:flex;justify-content:flex-end;gap:.6rem;margin-top:1.2rem}
+  .modal .hint{color:#777;font-size:.82rem;margin:.4rem 0}
+  /* ---- 页内 Toast ---- */
+  #toast{position:fixed;top:1rem;left:50%;transform:translateX(-50%);z-index:200;display:none;padding:.6rem 1.2rem;border-radius:8px;font-size:.92rem;box-shadow:0 4px 16px rgba(0,0,0,.5)}
+  #toast.ok{display:block;background:#243;color:#cfc}
+  #toast.err{display:block;background:#322;color:#fcc}
+  .lap-inputs{display:flex;gap:.5rem;align-items:center}
+  .lap-inputs input{width:100%}
+  .lap-inputs span{color:#9ab}
+  /* ---- 自绘 combobox（可输入筛选 + 下拉限高滚动） ---- */
+  .combo{position:relative}
+  .combo>input{width:100%;box-sizing:border-box;padding:.5rem;border:1px solid #444;border-radius:8px;background:#2a2a2c;color:#eee;font-size:.95rem}
+  /* position:fixed 挂到 body 视口坐标——避免被弹窗 overflow:auto 裁剪 */
+  .combo-list{position:fixed;background:#2a2a2c;border:1px solid #555;border-radius:8px;max-height:calc(10 * 34px);overflow-y:auto;z-index:220;display:none;scrollbar-width:thin;scrollbar-color:#555 #2a2a2c}
+  .combo-list.open{display:block}
+  .combo-item{padding:.45rem .7rem;cursor:pointer;font-size:.9rem;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .combo-item:hover,.combo-item.hl{background:#3a3a40}
+  .combo-item.sel{color:#8af}
+  /* ---- 分页 ---- */
+  .pager{display:flex;gap:.8rem;align-items:center;justify-content:flex-end;margin-top:.8rem;font-size:.88rem;color:#9ab}
+  .pager select{padding:.25rem .4rem;border:1px solid #444;border-radius:6px;background:#2a2a2c;color:#eee}
+  .pager button{padding:.2rem .6rem}
+  .pager .cur{color:#fff;font-weight:bold}
 </style>
 </head>
 <body>
 <nav>
-  <strong>🏁 围场</strong>
+  <span class="brand">{{ logo_html | safe }} {{ site_title }}</span>
   <a href="/admin/users" class="{% if active == "users" %}active{% endif %}">用户</a>
-  <a href="/admin/pending" class="{% if active == "pending" %}active{% endif %}">注册代绑</a>
   <a href="/admin/laps" class="{% if active == "laps" %}active{% endif %}">成绩</a>
   <a href="/admin/settings" class="{% if active == "settings" %}active{% endif %}">设置</a>
   <span class="spacer"></span>
   <form class="inline" method="post" action="/admin/logout"><button class="btn">退出</button></form>
 </nav>
+<div id="toast"></div>
+<script>
+// ---- 页内 Toast ----
+function toast(msg, ok){
+  const t = document.getElementById('toast');
+  t.textContent = msg;
+  t.className = ok ? 'ok' : 'err';
+  clearTimeout(t._h);
+  t._h = setTimeout(()=>{ t.className=''; }, 3500);
+}
+// ---- 页内弹窗 ----
+// openModal({title, body(html), onOk(->Promise), okText, danger})
+function openModal(opt){
+  const mask = document.createElement('div');
+  mask.className = 'modal-mask';
+  const okBtn = `<button class="btn ${opt.danger?'danger':'primary'}" id="m-ok">${opt.okText||'确定'}</button>`;
+  mask.innerHTML = `<div class="modal"><h3>${opt.title}</h3>${opt.body}<div class="actions"><button class="btn" id="m-cancel">取消</button>${okBtn}</div></div>`;
+  document.body.appendChild(mask);
+  const close = ()=>mask.remove();
+  // 遮罩点击关闭用 mousedown 判定按下起点：弹窗内拖选文字（如复制用户名）松开在弹窗外，
+  // 浏览器把 click 派发给按下/松开的共同祖先（=遮罩），按 click 判会误关弹窗
+  mask.addEventListener('mousedown', e=>{ if(e.target===mask) close(); });
+  mask.querySelector('#m-cancel').onclick = close;
+  mask.querySelector('#m-ok').onclick = async ()=>{
+    try{
+      const msg = await opt.onOk(mask);
+      if(msg !== undefined){ toast(msg, true); close(); }
+    }catch(e){ toast(e.message||String(e), false); }
+  };
+  return { close, el: mask };
+}
+// ---- JSON API 调用 ----
+async function api(url, data){
+  const res = await fetch(url, {
+    method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body: JSON.stringify(data||{})
+  });
+  const j = await res.json().catch(()=>({ok:false,message:'响应解析失败'}));
+  if(!j.ok) throw new Error(j.message||'操作失败');
+  return j.message;
+}
+// ---- 表格刷新：重新 fetch 当前路径，替换 main 内容 ----
+async function refreshPage(){
+  const res = await fetch(location.pathname + location.search);
+  if(res.redirected || !res.ok){ location.href='/admin'; return; }
+  const html = await res.text();
+  const doc = new DOMParser().parseFromString(html,'text/html');
+  document.querySelector('main').innerHTML = doc.querySelector('main').innerHTML;
+}
+function splitMs(ms){ return [Math.floor(ms/60000), Math.floor(ms%60000/1000), ms%1000]; }
+// 模板变量占位符（运行时拼接，避免与服务端模板语法冲突）
+const L = '{', R = '}';
+const varTag = k => L+L+k+R+R;
+// ---- 自绘 combobox：输入实时过滤 + 下拉限高10条滚动（点击外部关闭） ----
+// combo(el, items, {placeholder, selected}) —— el 为容器；items = [{value,label}]
+// 输入框显示 label（人类可读名），selected 存 value；二者分离。
+function makeCombo(container, items, opt){
+  container.classList.add('combo');
+  const selItem = items.find(it=>it.value===opt.selected);
+  container.innerHTML = `<input autocomplete="off" placeholder="${opt.placeholder||''}" value="${selItem?selItem.label:''}"><div class="combo-list"></div>`;
+  const input = container.querySelector('input');
+  const list = container.querySelector('.combo-list');
+  let filtered = items, hl = -1;
+  function renderList(){
+    list.innerHTML = filtered.slice(0, 100).map((it,i)=>
+      `<div class="combo-item${it.value===opt.selected?' sel':''}${i===hl?' hl':''}" data-v="${it.value}" data-l="${it.label}">${it.label}</div>`).join('')
+      || '<div class="combo-item" style="color:#777">无匹配项</div>';
+  }
+  function place(){
+    const r = input.getBoundingClientRect();
+    list.style.left = r.left+'px';
+    list.style.top = (r.bottom+2)+'px';
+    list.style.width = r.width+'px';
+  }
+  function open(){
+    filtered = items.filter(it=>!input.value || it.label.includes(input.value));
+    hl = -1;
+    renderList();
+    place();
+    list.classList.add('open');
+  }
+  function close(){ list.classList.remove('open'); }
+  // 滚动时重定位而非收起（fixed 坐标随源滚动失效；聚焦引发的自动滚动也会触发 scroll，
+  // 若按 close 处理列表会在展开瞬间被收起=闪现）；输入框滚出视口才收
+  window.addEventListener('scroll', e=>{
+    if(!list.classList.contains('open') || e.target===list) return;
+    place();
+    const r = input.getBoundingClientRect();
+    if(r.bottom < 0 || r.top > window.innerHeight) close();
+  }, true);
+  window.addEventListener('resize', place);
+  // 文字选择完全放行：mousedown 不做任何 preventDefault，拖选/调整选区始终原生可用。
+  // 开合逻辑独立：mousedown 开（含重新定位），blur 收；已展开时拖选不闪不收。
+  input.addEventListener('mousedown', ()=>{
+    // 收起页面所有其他已展开的 combo（互斥）
+    document.querySelectorAll('.combo-list.open').forEach(el=>{ if(el!==list) el.classList.remove('open'); });
+    open();
+  });
+  input.addEventListener('focus', open);
+  input.addEventListener('input', open);
+  input.addEventListener('blur', ()=>setTimeout(close, 150));
+  list.addEventListener('mousedown', e=>{
+    const it = e.target.closest('.combo-item[data-v]');
+    if(!it) return;
+    input.value = it.dataset.l; // 显示 label（赛道名），值存 data-v
+    opt.selected = it.dataset.v;
+    opt.onChange && opt.onChange(it.dataset.v);
+    close();
+  });
+  input.addEventListener('keydown', e=>{
+    if(e.key==='ArrowDown'){ hl=Math.min(hl+1, filtered.length-1); renderList(); e.preventDefault(); }
+    else if(e.key==='ArrowUp'){ hl=Math.max(hl-1,0); renderList(); e.preventDefault(); }
+    else if(e.key==='Enter'){
+      if(hl>=0 && filtered[hl]){ input.value=filtered[hl].label; opt.selected=filtered[hl].value; opt.onChange&&opt.onChange(filtered[hl].value); }
+      close(); e.preventDefault();
+    }
+    else if(e.key==='Escape'){ close(); }
+  });
+  return {
+    get value(){ return opt.selected||''; },
+    setItems(newItems){ items = newItems; },
+    setValue(v){ const it=items.find(x=>x.value===v); input.value=it?it.label:v; opt.selected=v; }
+  };
+}
+// ---- 分页条 ----
+// renderPager(el, page, pages, size, onPage, onSize)
+function renderPager(el, page, pages, size, onPage, onSize){
+  el.innerHTML = `
+    <span>每页</span>
+    <select>${[30,50,100].map(s=>`<option value="${s}" ${s===size?'selected':''}>${s}</option>`).join('')}</select>
+    <span>条 · 共 ${pages} 页</span>
+    <button class="btn" id="pg-prev" ${page<=1?'disabled':''}>上一页</button>
+    <span class="cur">${page} / ${pages}</span>
+    <button class="btn" id="pg-next" ${page>=pages?'disabled':''}>下一页</button>`;
+  el.querySelector('select').onchange = e=>onSize(parseInt(e.target.value));
+  el.querySelector('#pg-prev').onclick = ()=>page>1 && onPage(page-1, size);
+  el.querySelector('#pg-next').onclick = ()=>page<pages && onPage(page+1, size);
+}
+</script>
 <main>
   {{ content | safe }}
 </main>
+
 </body>
 </html>

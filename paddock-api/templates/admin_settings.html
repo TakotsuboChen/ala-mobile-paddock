@@ -1,33 +1,393 @@
 <h2>设置</h2>
-{% if !notice.is_empty() %}<p class="notice">{{ notice }}</p>{% endif %}
 
-<h3 style="color:#8af;margin-top:1.2rem">QQ 机器人（CAMDA 群）</h3>
-<form method="post" action="/admin/settings/bot" style="max-width:560px">
-  <label style="display:block;margin:.6rem 0 .2rem">AppID</label>
-  <input name="bot_app_id" value="{{ bot_app_id }}" style="width:100%;box-sizing:border-box;padding:.5rem;border:1px solid #444;border-radius:8px;background:#2a2a2c;color:#eee">
-  <label style="display:block;margin:.6rem 0 .2rem">AppSecret {% if bot_secret_set %}<span style="color:#7c7">（已设置，留空保留）</span>{% endif %}</label>
-  <input name="bot_app_secret" type="password" value="" placeholder="{% if bot_secret_set %}留空 = 不修改{% else %}必填{% endif %}" style="width:100%;box-sizing:border-box;padding:.5rem;border:1px solid #444;border-radius:8px;background:#2a2a2c;color:#eee">
-  <p style="color:#777;font-size:.85rem">webhook 回调地址：<span class="code">https://&lt;域名&gt;/qq/webhook</span>（开放平台「回调配置」填此地址，勾选 <span class="code">GROUP_MESSAGE_CREATE</span>；IP 白名单填服务器公网地址）</p>
-  <button class="btn" style="margin-top:.6rem">保存</button>
+<h3 style="color:#8af;margin-top:1.2rem">站点品牌</h3>
+<form id="brand-form" style="max-width:560px">
+  <label style="display:block;margin:.6rem 0 .2rem">站点名称</label>
+  <input id="brand-title" value="{{ site_title }}" style="width:100%;box-sizing:border-box;padding:.5rem;border:1px solid #444;border-radius:8px;background:#2a2a2c;color:#eee">
+  <label style="display:block;margin:.6rem 0 .2rem">站点 Logo</label>
+  <div style="display:flex;gap:.8rem;align-items:center">
+    <img id="brand-preview" src="{{ site_logo_src }}"
+         style="width:48px;height:48px;object-fit:contain;border:1px solid #333;border-radius:8px;background:#222">
+    <input type="file" id="brand-file" accept=".svg,image/svg+xml,image/png,image/jpeg,image/webp" style="color:#9ab">
+    <button type="button" class="btn" onclick="brandClear()">恢复默认</button>
+  </div>
+  <button class="btn primary" style="margin-top:.8rem" onclick="brandSave()">保存品牌</button>
 </form>
 
+<h3 style="color:#8af;margin-top:2rem">QQ 机器人</h3>
+<form id="bot-form" style="max-width:560px">
+  <label style="display:block;margin:.6rem 0 .2rem">AppID</label>
+  <input id="bot-app-id" value="{{ bot_app_id }}" style="width:100%;box-sizing:border-box;padding:.5rem;border:1px solid #444;border-radius:8px;background:#2a2a2c;color:#eee">
+  <label style="display:block;margin:.6rem 0 .2rem">AppSecret {% if bot_secret_set %}<span style="color:#7c7">已设置</span>{% endif %}</label>
+  <input id="bot-secret" type="password" autocomplete="new-password" placeholder="{% if bot_secret_set %}••••••••{% else %}必填{% endif %}"
+         style="width:100%;box-sizing:border-box;padding:.5rem;border:1px solid #444;border-radius:8px;background:#2a2a2c;color:#eee">
+  <p style="color:#777;font-size:.85rem">webhook 回调地址：<span class="code">https://&lt;域名&gt;/qq/webhook</span>（开放平台「回调配置」填此地址，勾选 <span class="code">GROUP_MESSAGE_CREATE</span>；IP 白名单填服务器公网地址）</p>
+  <button class="btn primary" onclick="botSave()">保存</button>
+</form>
+
+<h3 style="color:#8af;margin-top:2rem">播报目标群</h3>
+<p style="color:#777;font-size:.85rem;max-width:640px">bot 收到过消息的群会自动出现在下面，勾选即播报；多群时消息模板不能使用 QQ 群用户名 变量。</p>
+<div id="group-list" style="display:flex;flex-direction:column;gap:.4rem;max-width:520px;margin:.6rem 0"></div>
+<button class="btn primary" onclick="groupsSave()">保存群选择</button>
+
+<h3 style="color:#8af;margin-top:2rem">消息配置</h3>
+<p style="color:#777;font-size:.85rem;max-width:640px">
+  被动回复：群消息满足条件时 bot 以<b>引用该消息</b>的形式回复模板。主动播报：满足条件的事件发生时 bot 向勾选的群推送消息（未认证应用主动消息额度极低，可能被平台限流）。多个条件可用「满足全部 / 满足任一」组合；内置动作（注册校验/密码重置）的触发词是提取锚点，码/用户名取其后的内容。
+</p>
+<div style="display:flex;gap:.5rem;margin:.6rem 0;flex-wrap:wrap" id="var-chips"></div>
+<button class="btn primary" onclick="ruleAdd()">新增规则</button>
+<div id="rule-list" style="margin-top:.8rem;display:flex;flex-direction:column;gap:.6rem;max-width:760px"></div>
+
 <h3 style="color:#8af;margin-top:2rem">管理员账号</h3>
-<form method="post" action="/admin/settings/username" style="max-width:560px">
+<form id="username-form" style="max-width:560px">
   <label style="display:block;margin:.6rem 0 .2rem">新用户名</label>
-  <input name="new_username" value="" placeholder="1–32 字符" required style="width:100%;box-sizing:border-box;padding:.5rem;border:1px solid #444;border-radius:8px;background:#2a2a2c;color:#eee">
-  <label style="display:block;margin:.6rem 0 .2rem">当前密码（验证）</label>
-  <input name="password" type="password" required style="width:100%;box-sizing:border-box;padding:.5rem;border:1px solid #444;border-radius:8px;background:#2a2a2c;color:#eee">
-  <button class="btn" style="margin-top:.6rem">修改用户名</button>
+  <input id="acc-new-username" placeholder="1–32 字符" style="width:100%;box-sizing:border-box;padding:.5rem;border:1px solid #444;border-radius:8px;background:#2a2a2c;color:#eee">
+  <label style="display:block;margin:.6rem 0 .2rem">当前密码</label>
+  <input id="acc-password" type="password" autocomplete="current-password" style="width:100%;box-sizing:border-box;padding:.5rem;border:1px solid #444;border-radius:8px;background:#2a2a2c;color:#eee">
+  <button class="btn primary" style="margin-top:.8rem" onclick="usernameSave()">修改用户名</button>
   <p style="color:#777;font-size:.85rem">修改后需用新用户名重新登录。</p>
 </form>
 
 <h3 style="color:#8af;margin-top:2rem">管理员密码</h3>
-<form method="post" action="/admin/settings/password" style="max-width:560px">
+<form id="pw-form" style="max-width:560px">
   <label style="display:block;margin:.6rem 0 .2rem">当前密码</label>
-  <input name="old_password" type="password" required style="width:100%;box-sizing:border-box;padding:.5rem;border:1px solid #444;border-radius:8px;background:#2a2a2c;color:#eee">
-  <label style="display:block;margin:.6rem 0 .2rem">新密码（≥8 位，含数字和字母）</label>
-  <input name="new_password" type="password" required style="width:100%;box-sizing:border-box;padding:.5rem;border:1px solid #444;border-radius:8px;background:#2a2a2c;color:#eee">
+  <input id="pw-old" type="password" autocomplete="current-password" style="width:100%;box-sizing:border-box;padding:.5rem;border:1px solid #444;border-radius:8px;background:#2a2a2c;color:#eee">
+  <label style="display:block;margin:.6rem 0 .2rem">新密码</label>
+  <input id="pw-new" type="password" autocomplete="new-password" style="width:100%;box-sizing:border-box;padding:.5rem;border:1px solid #444;border-radius:8px;background:#2a2a2c;color:#eee">
   <label style="display:block;margin:.6rem 0 .2rem">确认新密码</label>
-  <input name="new_password2" type="password" required style="width:100%;box-sizing:border-box;padding:.5rem;border:1px solid #444;border-radius:8px;background:#2a2a2c;color:#eee">
-  <button class="btn" style="margin-top:.6rem">修改密码</button>
+  <input id="pw-new2" type="password" autocomplete="new-password" style="width:100%;box-sizing:border-box;padding:.5rem;border:1px solid #444;border-radius:8px;background:#2a2a2c;color:#eee">
+  <button class="btn primary" style="margin-top:.8rem" onclick="pwSave()">修改密码</button>
 </form>
+
+<script>
+const RULES = {{ rules_json | safe }};
+// 变量芯片：insert 到当前编辑弹窗的 textarea（varTag 运行时拼接占位符，避开服务端模板语法）
+const REPLY_VARS = [
+  ['围场用户名','paddock_name'], ['围场 ID','paddock_id'], ['校验码','code'],
+];
+const BCAST_VARS = [
+  ['围场用户名','paddock_name'], ['围场 ID','paddock_id'], ['赛道名称','track'], ['圈速','lap'], ['版本','version'],
+];
+const OPS = [['contains','包含'],['not_contains','不包含'],['equals','等于'],['starts','开头是'],['ends','结尾是']];
+const EVENTS = [['record_alltime','刷新历史纪录'],['record_version','刷新版本纪录']];
+
+// 变量芯片：复制到剪贴板（不自动插入输入框）
+function insertVar(key){
+  const text = varTag(key);
+  (navigator.clipboard?.writeText(text) ?? Promise.reject()).then(
+    ()=>toast(`已复制 ${text}`, true),
+    ()=>{ // 剪贴板 API 不可用（非安全上下文）降级 execCommand
+      const ta=document.createElement('textarea');
+      ta.value=text; document.body.appendChild(ta); ta.select();
+      document.execCommand('copy'); ta.remove();
+      toast(`已复制 ${text}`, true);
+    }
+  );
+}
+function condText(c){
+  const opLabel = (OPS.find(([k])=>k===c.op)||['',c.op])[1];
+  if(c.field==='event'){
+    const ev = EVENTS.find(([k])=>k===c.value);
+    return `事件 ${opLabel} ${ev?ev[1]:c.value}`;
+  }
+  return `内容 ${opLabel} "${c.value}"`;
+}
+const ACTIONS = [['reply','普通回复'],['reg_code','注册校验（建号）'],['reset_password','密码重置（发码）']];
+function actionLabel(a){ return (ACTIONS.find(([k])=>k===a)||['',a])[1]; }
+function isActionRule(r){ return r.kind==='reply' && (r.action==='reg_code'||r.action==='reset_password'); }
+// 动作规则的每类失败字段（label + BotRule 字段名）
+const FAIL_FIELDS = {
+  reg_code: [
+    ['no_code_template','提不出校验码（触发词后没有 #码）'],
+    ['invalid_code_template','校验码无效/过期'],
+    ['dup_openid_template','该 QQ 已有在途会话/已绑定'],
+    ['no_identity_template','无法识别群身份'],
+  ],
+  reset_password: [
+    ['no_user_template','用户名不存在'],
+  ],
+};
+function renderRules(){
+  const box = document.getElementById('rule-list');
+  box.innerHTML = RULES.length ? '' : '<p style="color:#777">暂无规则</p>';
+  RULES.forEach((r, i)=>{
+    const div = document.createElement('div');
+    div.style.cssText = 'background:#1c1c1e;border:1px solid #333;border-radius:8px;padding:.7rem .9rem';
+    let condDesc;
+    if(isActionRule(r)){
+      condDesc = `触发词「${r.keyword}」`;
+    } else {
+      condDesc = r.conditions.length
+        ? r.conditions.map(c=>condText(c)).join(r.match_all?' 且 ':' 或 ')
+        : '恒触发';
+    }
+    const actDesc = isActionRule(r) ? ` · ${actionLabel(r.action)}` : '';
+    div.innerHTML = `
+      <div style="display:flex;gap:.8rem;align-items:center">
+        <span class="btn" style="background:${r.kind==='broadcast'?'#6a5':'#456'};cursor:default;font-size:.75rem">${r.kind==='broadcast'?'播报':'回复'}</span>
+        <div style="flex:1;min-width:0">
+          <div style="font-size:.85rem">${condDesc.replaceAll('<','&lt;')}${actDesc}</div>
+          <div style="color:#9ab;font-size:.85rem;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${r.template.replaceAll('<','&lt;')}</div>
+        </div>
+        <label style="display:flex;align-items:center;gap:.3rem;font-size:.8rem"><input type="checkbox" ${r.enabled?'checked':''} onchange="ruleToggle(${i})">启用</label>
+        <button class="btn" onclick="ruleEdit(${i})">编辑</button>
+        <button class="btn danger" onclick="ruleDel(${i})">删除</button>
+      </div>`;
+    box.appendChild(div);
+  });
+}
+function saveRules(){
+  return api('/admin/api/bot/rules', {rules: RULES});
+}
+function ruleToggle(i){ RULES[i].enabled = !RULES[i].enabled; saveRules().then(m=>toast(m,true)).catch(e=>{toast(e.message,false); RULES[i].enabled=!RULES[i].enabled;}); }
+function ruleDel(i){
+  openModal({ title:'删除规则', danger:true, body:'<p class="hint">确认删除该规则？保存后立即生效。</p>', okText:'删除',
+    onOk: async ()=>{ RULES.splice(i,1); await saveRules(); renderRules(); return '规则已删除'; } });
+}
+function ruleEdit(i){ ruleModal(RULES[i]); }
+function ruleAdd(){
+  ruleModal({id:'', kind:'reply', action:'reply', keyword:'', conditions:[{field:'content',op:'contains',value:''}], match_all:true, template:'', fail_template:'', enabled:true});
+}
+let modalKind = 'reply';
+// 变量芯片按场景：成功模板 / 失败模板（code/name 可用）
+function chipsFor(kind, action){
+  const vs = kind==='broadcast' ? BCAST_VARS
+    : (action==='reg_code'||action==='reset_password') ? REPLY_VARS
+    : REPLY_VARS.filter(([l,k])=>k!=='code');
+  return vs.map(([label,key])=>`<button type="button" class="btn" style="font-size:.78rem" onclick="insertVar('${key}')">${label}</button>`).join(' ');
+}
+function failChips(){
+  return `<button type="button" class="btn" style="font-size:.78rem" onclick="insertFailVar('code')">校验码</button>
+          <button type="button" class="btn" style="font-size:.78rem" onclick="insertFailVar('name')">用户名</button>`;
+}
+function insertFailVar(key){ insertVar(key); }
+function kindSwitch(kind){
+  modalKind = kind;
+  const action = window._editingRule.action || 'reply';
+  const isAct = kind==='reply' && (action==='reg_code'||action==='reset_password');
+  const show = (id, on)=>{ const el=document.getElementById(id); if(el) el.style.display = on?'block':'none'; };
+  show('m-action-wrap', kind==='reply');
+  show('m-kw-wrap', isAct);
+  show('m-cond-wrap', kind==='broadcast' || (kind==='reply' && !isAct));
+  show('m-fail-wrap', isAct);
+  show('m-fail-generic-wrap', kind==='reply' && !isAct);
+  const v = document.getElementById('m-vars');
+  if(v) v.innerHTML = chipsFor(kind, action);
+  renderCondEditor();
+  renderFailFields();
+}
+// ---- 条件编辑器（与或组合） ----
+function renderCondEditor(){
+  const r = window._editingRule;
+  const holder = document.getElementById('m-conds');
+  if(!holder) return;
+  holder.innerHTML = r.conditions.map((c,ci)=>`
+    <div style="display:flex;gap:.4rem;margin:.3rem 0;align-items:center">
+      <select onchange="updCond(${ci},'field',this.value)" style="flex:1;padding:.35rem;border:1px solid #444;border-radius:6px;background:#2a2a2c;color:#eee">
+        ${modalKind==='broadcast'
+          ? '<option value="event" '+(c.field==='event'?'selected':'')+'>事件</option>'
+          : '<option value="content" '+(c.field==='content'?'selected':'')+'>消息内容</option>'}
+      </select>
+      <select onchange="updCond(${ci},'op',this.value)" style="flex:1;padding:.35rem;border:1px solid #444;border-radius:6px;background:#2a2a2c;color:#eee">
+        ${OPS.map(([v,l])=>`<option value="${v}" ${c.op===v?'selected':''}>${l}</option>`).join('')}
+      </select>
+      ${c.field==='event'
+        ? `<select onchange="updCond(${ci},'value',this.value)" style="flex:2;padding:.35rem;border:1px solid #444;border-radius:6px;background:#2a2a2c;color:#eee">${EVENTS.map(([v,l])=>`<option value="${v}" ${c.value===v?'selected':''}>${l}</option>`).join('')}</select>`
+        : `<input value="${c.value.replaceAll('"','&quot;')}" oninput="updCond(${ci},'value',this.value)" style="flex:2;padding:.35rem;border:1px solid #444;border-radius:6px;background:#2a2a2c;color:#eee" placeholder="条件值">`}
+      <button type="button" class="btn danger" onclick="delCond(${ci})">×</button>
+    </div>`).join('') || '<p style="color:#777;font-size:.82rem">无条件 = 恒触发</p>';
+  const ma = document.getElementById('m-match-all');
+  if(ma) ma.value = window._editingRule.match_all ? 'and' : 'or';
+}
+// ---- 动作规则的每类失败文案编辑器（预填内置默认） ----
+function renderFailFields(){
+  const holder = document.getElementById('m-fail-fields');
+  if(!holder) return;
+  const action = window._editingRule.action || 'reply';
+  const fields = FAIL_FIELDS[action] || [];
+  holder.innerHTML = fields.map(([f,label])=>`
+    <label style="margin:.5rem 0 .2rem">${label}</label>
+    <textarea data-f="${f}" rows="2" style="width:100%;box-sizing:border-box;padding:.5rem;border:1px solid #444;border-radius:8px;background:#2a2a2c;color:#eee;font-family:inherit">${((window._editingRule[f]||'')||'').replaceAll('<','&lt;')}</textarea>
+    <div style="display:flex;gap:.4rem;flex-wrap:wrap;margin:.2rem 0">${failChips()}</div>`).join('');
+  holder.querySelectorAll('textarea[data-f]').forEach(ta=>{
+    ta.addEventListener('input', ()=>{ window._editingRule[ta.dataset.f] = ta.value; });
+    ta.addEventListener('focus', ()=>{ window._activeFail = ta; });
+  });
+}
+function updCond(i, k, v){ window._editingRule.conditions[i][k] = v; }
+function delCond(i){ window._editingRule.conditions.splice(i,1); renderCondEditor(); }
+function addCond(){
+  const r = window._editingRule;
+  r.conditions.push({field: modalKind==='broadcast'?'event':'content', op:'contains', value:''});
+  renderCondEditor();
+}
+function actionSwitch(action){
+  if(!window._editingRule) return;
+  // 切动作时预填该动作的失败文案默认值（取内置预设）
+  const preset = PRESET_FAIL[action] || {};
+  for(const [f] of FAIL_FIELDS[action] || []){
+    if(!window._editingRule[f]) window._editingRule[f] = preset[f] || '';
+  }
+  kindSwitch(document.getElementById('m-kind').value);
+}
+// 内置默认失败文案（前端镜像 preset_rules，供"恢复默认"与切动作预填）
+const PRESET_FAIL = {
+  reg_code: {
+    no_code_template: '未识别到校验码：请在「申请围场通行证」后跟 #校验码（模块端申请页可复制完整指令）',
+    invalid_code_template: '校验码 '+varTag('code')+' 无效或已过期，请在围场页重新申请',
+    dup_openid_template: '该 QQ 身份已有其他注册校验在途，请勿重复申请',
+    no_identity_template: '无法识别你的群身份，请确认已在 QQ 群设置中允许机器人获取群信息',
+  },
+  reset_password: { no_user_template: '用户名不存在，请核对后重试' },
+};
+function ruleModal(r){
+  window._editingRule = JSON.parse(JSON.stringify(r));
+  if(!window._editingRule.action) window._editingRule.action = 'reply';
+  modalKind = r.kind;
+  const isAct = isActionRule(window._editingRule);
+  openModal({
+    title: r.id ? '编辑规则' : '新增规则',
+    body: `
+      <label>类型</label>
+      <select id="m-kind" onchange="kindSwitch(this.value)">
+        <option value="reply" ${r.kind==='reply'?'selected':''}>被动回复（消息触发）</option>
+        <option value="broadcast" ${r.kind==='broadcast'?'selected':''}>主动播报（事件触发）</option>
+      </select>
+      <div id="m-action-wrap">
+        <label>动作（触发后 bot 实际做什么）</label>
+        <select id="m-action" onchange="actionSwitch(this.value)">
+          ${ACTIONS.map(([v,l])=>`<option value="${v}" ${(window._editingRule.action||'reply')===v?'selected':''}>${l}</option>`).join('')}
+        </select>
+      </div>
+      <div id="m-kw-wrap">
+        <label>触发词（即触发条件；校验码/用户名取词后内容，注册码需带 #）</label>
+        <input id="m-keyword" value="${(window._editingRule.keyword||'').replaceAll('"','&quot;')}">
+      </div>
+      <div id="m-cond-wrap">
+        <label>触发条件</label>
+        <select id="m-match-all" onchange="window._editingRule.match_all=this.value==='and'"><option value="and">满足全部条件（且）</option><option value="or">满足任一条件（或）</option></select>
+        <div id="m-conds"></div>
+        <button type="button" class="btn" onclick="addCond()">+ 添加条件</button>
+      </div>
+      <label>${isAct?'成功文案':'消息模板'}</label><textarea id="m-template" rows="3" style="width:100%;box-sizing:border-box;padding:.5rem;border:1px solid #444;border-radius:8px;background:#2a2a2c;color:#eee;font-family:inherit">${r.template.replaceAll('<','&lt;')}</textarea>
+      <div id="m-fail-wrap">
+        <label style="color:#faa;margin-top:1rem">失败文案（每类失败独立，可编辑；code 变量 = 校验码，name 变量 = 用户名）</label>
+        <div id="m-fail-fields"></div>
+      </div>
+      <div id="m-fail-generic-wrap">
+        <label style="margin-top:1rem">失败模板（留空 = 使用各类型内置默认文案）</label>
+        <textarea id="m-fail" rows="2" style="width:100%;box-sizing:border-box;padding:.5rem;border:1px solid #444;border-radius:8px;background:#2a2a2c;color:#eee;font-family:inherit">${(r.fail_template||'').replaceAll('<','&lt;')}</textarea>
+      </div>
+      <label>快捷变量</label><div style="display:flex;gap:.4rem;flex-wrap:wrap" id="m-vars">${chipsFor(r.kind, window._editingRule.action)}</div>`,
+    okText: '保存规则',
+    onOk: async (mask)=>{
+      const kind = mask.querySelector('#m-kind').value;
+      const action = kind==='reply' ? (mask.querySelector('#m-action')?.value||'reply') : 'reply';
+      const template = mask.querySelector('#m-template').value;
+      const fail_template = mask.querySelector('#m-fail')?.value||'';
+      const isAct = kind==='reply' && (action==='reg_code'||action==='reset_password');
+      const match_all = mask.querySelector('#m-match-all').value==='and';
+      const keyword = mask.querySelector('#m-keyword')?.value.trim()||'';
+      const src = window._editingRule;
+      const conditions = isAct ? [] : src.conditions.filter(c=>c.value.trim()!=='' || c.field==='event');
+      if(kind==='reply' && !isAct && conditions.length===0 && keyword==='')
+        throw new Error('回复规则至少需要一个条件或触发词');
+      if(!template.trim()) throw new Error('消息模板不能为空');
+      if(isAct && !keyword) throw new Error('内置动作规则必须填写触发词（提取锚点）');
+      const target = r.id ? RULES.find(x=>x.id===r.id) : null;
+      const patch = {kind, action, keyword, conditions, match_all, template, fail_template};
+      for(const [f] of (isAct ? FAIL_FIELDS[action] : [])) patch[f] = src[f]||'';
+      if(target){ Object.assign(target, patch); }
+      else { RULES.push({id: 'r'+Date.now(), ...patch, enabled: true}); }
+      await saveRules();
+      renderRules();
+      return '规则已保存';
+    }
+  });
+  kindSwitch(r.kind);
+}
+renderRules();
+
+// ---- 播报目标群 ----
+let KNOWN = [], SELECTED = [], GNAMES = {};
+async function loadGroups(){
+  const res = await fetch('/admin/api/bot/groups');
+  const j = await res.json();
+  KNOWN = j.known||[]; SELECTED = j.selected||[]; GNAMES = j.names||{};
+  renderGroups();
+}
+function groupLabel(g){
+  const raw = GNAMES[g];
+  if(!raw) return g;
+  const [name, member] = raw.split('|');
+  return member && member !== '0' ? `${name}（${member} 人）` : name;
+}
+function renderGroups(){
+  const box = document.getElementById('group-list');
+  if(!KNOWN.length){ box.innerHTML = '<p style="color:#777;font-size:.85rem">暂无已知群——bot 在群里收到过消息后会自动出现在这里。</p>'; return; }
+  box.innerHTML = KNOWN.map(g=>`
+    <label style="display:flex;align-items:center;gap:.5rem;background:#1c1c1e;border:1px solid #333;border-radius:8px;padding:.5rem .8rem">
+      <input type="checkbox" value="${g}" ${SELECTED.includes(g)?'checked':''} onchange="grpChange(this)">
+      <span style="font-size:.9rem">${groupLabel(g).replaceAll('<','&lt;')}</span>
+      ${SELECTED.includes(g)?'<span style="color:#7c7;font-size:.8rem;margin-left:auto">播报已开启</span>':''}
+    </label>`).join('');
+}
+function grpChange(cb){
+  if(cb.checked){ if(!SELECTED.includes(cb.value)) SELECTED.push(cb.value); }
+  else SELECTED = SELECTED.filter(g=>g!==cb.value);
+  renderGroups();
+}
+async function groupsSave(){
+  const msg = await api('/admin/api/bot/groups', {groups: SELECTED});
+  toast(msg, true);
+  renderRules(); // 多群状态变化可能影响变量可用性
+}
+loadGroups();
+
+// ---- 品牌 ----
+let brandLogoData = null; // null = 不改；'' = 清除
+document.getElementById('brand-file').addEventListener('change', e=>{
+  const f = e.target.files[0];
+  if(!f) return;
+  if(f.size > 256*1024){ toast('Logo 不能超过 256KB', false); e.target.value=''; return; }
+  const rd = new FileReader();
+  rd.onload = ()=>{
+    brandLogoData = rd.result;
+    document.getElementById('brand-preview').src = brandLogoData;
+  };
+  rd.readAsDataURL(f);
+});
+function brandClear(){ brandLogoData=''; document.getElementById('brand-preview').src = '{{ favicon_href }}'; }
+async function brandSave(){
+  const msg = await api('/admin/api/brand', {site_title: document.getElementById('brand-title').value, site_logo: brandLogoData});
+  toast(msg, true);
+  setTimeout(()=>location.reload(), 600);
+}
+// ---- bot ----
+async function botSave(){
+  const msg = await api('/admin/api/settings/bot', {
+    bot_app_id: document.getElementById('bot-app-id').value,
+    bot_app_secret: document.getElementById('bot-secret').value,
+  });
+  toast(msg, true);
+  setTimeout(()=>location.reload(), 600);
+}
+// ---- 管理员 ----
+async function usernameSave(){
+  const msg = await api('/admin/api/settings/username', {
+    new_username: document.getElementById('acc-new-username').value,
+    password: document.getElementById('acc-password').value,
+  });
+  toast(msg+'，即将跳转登录', true);
+  setTimeout(()=>location.href='/admin', 900);
+}
+async function pwSave(){
+  const msg = await api('/admin/api/settings/password', {
+    old_password: document.getElementById('pw-old').value,
+    new_password: document.getElementById('pw-new').value,
+    new_password2: document.getElementById('pw-new2').value,
+  });
+  toast(msg+'，即将跳转登录', true);
+  setTimeout(()=>location.href='/admin', 900);
+}
+</script>
