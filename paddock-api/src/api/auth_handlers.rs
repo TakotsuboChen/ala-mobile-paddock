@@ -412,5 +412,8 @@ pub fn router() -> Router<AppState> {
         .route("/auth/login", post(login))
         .route("/auth/reset-by-code", post(reset_by_code))
         .route("/me", get(me))
-        .route("/health", get(|| async { "ok" }))
+        .route("/health", get(|| async { Json(serde_json::json!({
+            "status": "ok",
+            "version": env!("CARGO_PKG_VERSION"),
+        })) }))
 }
