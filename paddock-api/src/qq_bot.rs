@@ -447,6 +447,8 @@ pub async fn broadcast(state: &App, event: &str, vars: &BroadcastVars) {
 const BCAST_GROUPS_CFG_KEY: &str = "bot_broadcast_groups";
 /// 群名缓存：group_openid → "群名称|member_num"（拿不到名称时名称段为空）。
 const GROUP_NAMES_CFG_KEY: &str = "bot_group_names";
+/// 群名人工覆盖：group_openid → 自定义显示名（管理端设置），优先于 API 缓存。
+const GROUP_NAMES_CUSTOM_CFG_KEY: &str = "bot_group_names_custom";
 
 /// webhook 收到群消息时登记该群（去重）并异步拉取群名称（/v2/groups/{id}/info，
 /// 30 QPM；11253 白名单权限不足时静默保留 openid 显示）。
@@ -504,9 +506,53 @@ async fn group_names_map(pool: &PgPool) -> std::collections::HashMap<String, Str
         .unwrap_or_default()
 }
 
-/// 群名缓存（管理端 API 用，公开包装）。
-pub async fn group_names_public(pool: &PgPool) -> std::collections::HashMap<String, String> {
-    group_names_map(pool).await
+/// 群名人工覆盖表（openid → 自定义名）。
+pub async fn group_names_custom_map(pool: &PgPool) -> std::collections::HashMap<String, String> {
+    get_cfg(pool, GROUP_NAMES_CUSTOM_CFG_KEY)
+        .await
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default()
+}
+
+/// 保存群名人工覆盖（openid → 名称；空名 = 删除该条覆盖，回落 API 缓存）。
+/// 只允许覆盖已知群；保存前 trim，全空表删键省存储。
+pub async fn set_group_name_custom(pool: &PgPool, openid: &str, name: &str) -> Result<(), String> {
+    let openid = openid.trim();
+    let known = known_groups(pool).await;
+    if !known.iter().any(|k| k == openid) {
+        return Err("群不在已知列表中".into());
+    }
+    let mut map = group_names_custom_map(pool).await;
+    let name = name.trim();
+    if name.is_empty() {
+        map.remove(openid);
+    } else {
+        if name.chars().count() > 32 {
+            return Err("名称最长 32 字符".into());
+        }
+        map.insert(openid.to_string(), name.to_string());
+    }
+    let val = if map.is_empty() {
+        String::new()
+    } else {
+        serde_json::to_string(&map).map_err(|e| e.to_string())?
+    };
+    set_cfg(pool, GROUP_NAMES_CUSTOM_CFG_KEY, &val)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// 群名缓存（管理端 API 用）：自定义覆盖与 API 缓存分键返回，前端按 自定义 > 缓存 优先显示。
+pub async fn group_names_public(
+    pool: &PgPool,
+) -> (
+    std::collections::HashMap<String, String>,
+    std::collections::HashMap<String, String>,
+) {
+    (
+        group_names_custom_map(pool).await,
+        group_names_map(pool).await,
+    )
 }
 
 /// bot 见过的全部群（设置页选择列表数据源）。

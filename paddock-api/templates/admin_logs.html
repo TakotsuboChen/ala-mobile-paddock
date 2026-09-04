@@ -1,11 +1,11 @@
 <h2>日志</h2>
 <div class="logtabs">
-  <button class="logtab active" id="tab-run" onclick="switchTab('run')">运行日志</button>
-  <button class="logtab" id="tab-evt" onclick="switchTab('evt')">业务事件</button>
+  <button class="logtab{% if tab != "evt" %} active{% endif %}" id="tab-run" onclick="switchTab('run')">运行日志</button>
+  <button class="logtab{% if tab == "evt" %} active{% endif %}" id="tab-evt" onclick="switchTab('evt')">业务事件</button>
 </div>
 
 <!-- ===== 运行日志视图：终端风，游标增量轮询 ===== -->
-<div id="view-run">
+<div id="view-run" {% if tab == "evt" %}style="display:none"{% endif %}>
   <div class="runbar">
     <span class="rundot" id="run-dot"></span>
     <span id="run-status">加载中…</span>
@@ -19,8 +19,9 @@
 </div>
 
 <!-- ===== 业务事件视图：原表格 ===== -->
-<div id="view-evt" style="display:none">
+<div id="view-evt" {% if tab != "evt" %}style="display:none"{% endif %}>
 <form method="get" action="/admin/logs" style="margin-bottom:.8rem;display:flex;gap:.6rem;align-items:center;flex-wrap:wrap">
+  <input type="hidden" name="tab" value="evt">
   <select name="level" style="padding:.4rem;border-radius:6px;border:1px solid #444;background:#2a2a2c;color:#eee">
     <option value="">全部级别</option>
     <option value="info" {% if level == "info" %}selected{% endif %}>info</option>
@@ -55,16 +56,20 @@
 </div>
 
 <script>
-// ---- Tab 切换 ----
+// ---- Tab 切换（切 tab 同步 URL，刷新/分享后仍停在本 tab） ----
 function switchTab(t){
   document.getElementById('view-run').style.display = t==='run' ? '' : 'none';
   document.getElementById('view-evt').style.display = t==='evt' ? '' : 'none';
   document.getElementById('tab-run').classList.toggle('active', t==='run');
   document.getElementById('tab-evt').classList.toggle('active', t==='evt');
+  const url = new URL(location.href);
+  if(t==='evt'){ url.searchParams.set('tab','evt'); P.tab = 'evt'; }
+  else { url.searchParams.delete('tab'); P.tab = ''; }
+  history.replaceState(null, '', url);
   if(t==='run') runStart();
 }
 // ---- 运行日志：游标增量轮询（2s）+ 级别着色 + 自动滚底 ----
-const P = { page: {{ page }}, pages: {{ pages }}, size: {{ size }}, q: {{ q_json | safe }}, level: "{{ level }}", cat: "{{ cat }}" };
+const P = { page: {{ page }}, pages: {{ pages }}, size: {{ size }}, q: {{ q_json | safe }}, level: "{{ level }}", cat: "{{ cat }}", tab: "{{ tab }}" };
 let runTimer = null, runLast = 0, runStarted = false;
 const MAX_VIEW_LINES = 3000; // 视图上限：DOM 行数超出丢头（防长开页面内存膨胀）
 
@@ -118,6 +123,7 @@ function runClearView(){
 // ---- 业务事件视图：分页条（切到该 tab 才可见） ----
 function goPage(p, s){
   const params = new URLSearchParams();
+  params.set('tab', 'evt');
   if(P.q) params.set('q', P.q);
   if(P.level) params.set('level', P.level);
   if(P.cat) params.set('cat', P.cat);
@@ -127,6 +133,6 @@ function goPage(p, s){
 }
 renderPager(document.getElementById('log-pager'), P.page, P.pages, P.size,
   (p,s)=>goPage(p,s), s=>goPage(1,s));
-// 默认显示运行日志 tab
-runStart();
+// 默认 tab 由服务端 tab 参数决定；轮询只在运行日志 tab 启动
+if(P.tab !== 'evt') runStart();
 </script>

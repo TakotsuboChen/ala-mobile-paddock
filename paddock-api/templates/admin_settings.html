@@ -309,14 +309,17 @@ function ruleModal(r){
 renderRules();
 
 // ---- 播报目标群 ----
-let KNOWN = [], SELECTED = [], GNAMES = {};
+let KNOWN = [], SELECTED = [], GNAMES = {}, GNAMES_CUSTOM = {};
 async function loadGroups(){
   const res = await fetch('/admin/api/bot/groups');
   const j = await res.json();
-  KNOWN = j.known||[]; SELECTED = j.selected||[]; GNAMES = j.names||{};
+  KNOWN = j.known||[]; SELECTED = j.selected||[]; GNAMES = j.names||{}; GNAMES_CUSTOM = j.names_custom||{};
   renderGroups();
 }
 function groupLabel(g){
+  // 自定义名 > QQ API 缓存名 > 裸 openid
+  const custom = GNAMES_CUSTOM[g];
+  if(custom) return custom;
   const raw = GNAMES[g];
   if(!raw) return g;
   const [name, member] = raw.split('|');
@@ -328,9 +331,27 @@ function renderGroups(){
   box.innerHTML = KNOWN.map(g=>`
     <label style="display:flex;align-items:center;gap:.5rem;background:#1c1c1e;border:1px solid #333;border-radius:8px;padding:.5rem .8rem">
       <input type="checkbox" value="${g}" ${SELECTED.includes(g)?'checked':''} onchange="grpChange(this)">
-      <span style="font-size:.9rem">${groupLabel(g).replaceAll('<','&lt;')}</span>
-      ${SELECTED.includes(g)?'<span style="color:#7c7;font-size:.8rem;margin-left:auto">播报已开启</span>':''}
+      <span style="font-size:.9rem;flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${groupLabel(g).replaceAll('<','&lt;')}</span>
+      ${SELECTED.includes(g)?'<span style="color:#7c7;font-size:.8rem">播报已开启</span>':''}
+      <button type="button" class="btn" style="font-size:.78rem" onclick="renameGroup('${g}')">改名</button>
     </label>`).join('');
+}
+function renameGroup(openid){
+  const cur = GNAMES_CUSTOM[openid] || '';
+  openModal({
+    title: '群显示名',
+    body: `<p class="hint">openid：<span class="code">${openid.replaceAll('<','&lt;')}</span><br>自定义名称便于辨认（留空 = 恢复 QQ 群名/裸 openid）。仅管理端显示用，不影响播报发送。</p>
+      <input id="g-name" value="${cur.replaceAll('"','&quot;')}" maxlength="32" placeholder="如：主群 / 涩涩群（1–32 字符）">`,
+    okText: '保存',
+    onOk: async (mask)=>{
+      const name = mask.querySelector('#g-name').value.trim();
+      const msg = await api('/admin/api/bot/group-name', {openid, name});
+      GNAMES_CUSTOM[openid] = name; // 空串时同步删除本地覆盖
+      if(!name) delete GNAMES_CUSTOM[openid];
+      renderGroups();
+      return msg;
+    }
+  });
 }
 function grpChange(cb){
   if(cb.checked){ if(!SELECTED.includes(cb.value)) SELECTED.push(cb.value); }

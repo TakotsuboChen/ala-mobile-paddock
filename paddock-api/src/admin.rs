@@ -477,6 +477,7 @@ struct LogsTemplate {
     q_json: String,
     level: String,
     cat: String,
+    tab: String,
     page: i64,
     size: i64,
     pages: i64,
@@ -500,6 +501,8 @@ struct LogQuery {
     level: String,
     #[serde(default)]
     cat: String,
+    #[serde(default)]
+    tab: String,
     #[serde(default = "default_page")]
     page: i64,
     #[serde(default = "default_size")]
@@ -580,6 +583,10 @@ async fn logs_page(
     if !["admin", "auth", "lap", "bot"].contains(&lq.cat.as_str()) {
         lq.cat.clear();
     }
+    // tab 收敛：只认 evt（业务事件），其余回落默认运行日志
+    if lq.tab != "evt" {
+        lq.tab.clear();
+    }
     // 页码收敛（size 白名单 + page 边界）需先拿总数——与用户/成绩页同节奏
     let like = format!("%{}%", lq.q);
     let total: i64 = sqlx::query_scalar(
@@ -606,6 +613,7 @@ async fn logs_page(
         q_json,
         level: lq.level.clone(),
         cat: lq.cat.clone(),
+        tab: lq.tab.clone(),
         page: pq.page,
         size: pq.size,
         pages: ((total + pq.size - 1) / pq.size).max(1),
@@ -1422,19 +1430,45 @@ async fn api_save_broadcast_groups(
     api_res(true, if f.groups.is_empty() { "已清空播报目标群（播报关闭）".to_string() } else { format!("播报目标群已保存（{} 个）", f.groups.len()) })
 }
 
-/// 已知群列表（设置页选择器数据源，带群名缓存）。
+/// 已知群列表（设置页选择器数据源）：names_custom = 人工覆盖名，names = QQ API 缓存名。
 async fn api_known_groups(State(state): State<App>, headers: HeaderMap) -> Response {
     if require_admin(&state, &headers).await.is_none() {
         return api_res(false, "会话已过期，请重新登录");
     }
-    let names = crate::qq_bot::group_names_public(&state.pool).await;
+    let (names_custom, names) = crate::qq_bot::group_names_public(&state.pool).await;
     Json(json!({
         "ok": true,
         "known": crate::qq_bot::known_groups(&state.pool).await,
         "selected": crate::qq_bot::broadcast_groups(&state.pool).await,
         "names": names,
+        "names_custom": names_custom,
     }))
     .into_response()
+}
+
+#[derive(Deserialize)]
+struct ApiGroupName {
+    openid: String,
+    /// 空串 = 清除自定义名（回落 QQ API 缓存名）
+    name: String,
+}
+
+/// 保存单个群的自定义显示名。
+async fn api_save_group_name(
+    State(state): State<App>,
+    headers: HeaderMap,
+    Json(f): Json<ApiGroupName>,
+) -> Response {
+    if require_admin(&state, &headers).await.is_none() {
+        return api_res(false, "会话已过期，请重新登录");
+    }
+    match crate::qq_bot::set_group_name_custom(&state.pool, &f.openid, &f.name).await {
+        Ok(()) => {
+            audit(&state.pool, "save_group_name", json!({"openid": f.openid})).await;
+            api_res(true, "群显示名已保存".to_string())
+        }
+        Err(e) => api_res(false, format!("保存失败：{e}")),
+    }
 }
 
 // ---------- 品牌 API ----------
@@ -1563,6 +1597,7 @@ pub fn router() -> Router<App> {
         .route("/api/bot/rules", post(api_save_rules))
         .route("/api/bot/groups", get(api_known_groups))
         .route("/api/bot/groups", post(api_save_broadcast_groups))
+        .route("/api/bot/group-name", post(api_save_group_name))
         .route("/api/runtime-logs", get(api_runtime_logs))
         .route("/api/brand", post(api_save_brand))
 }
