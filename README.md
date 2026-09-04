@@ -1,45 +1,103 @@
 # Ala Mobile Paddock（围场）
 
-Ala Mobile 私服第一步：计时赛圈速排行榜后端。
+[![License: Apache-2.0](https://img.shields.io/badge/License-Apache--2.0-blue.svg)](LICENSE)
+[![Version](https://img.shields.io/badge/version-1.0.0-green)](CHANGELOG.md)
+![Rust](https://img.shields.io/badge/Rust-edition%202024-orange)
 
-> **契约源**：`../ala-mobile-tool/docs/PADDOCK_PLAN.md` —— 本仓库与 LSPosed 模块仓库
-> 共用该计划文档作为唯一契约（API 形状、赛道表、积分公式），任何一侧变更必须两边同步。
-> 开发会话始终开在模块仓库目录，两边同会话配合。
+[F1 手游 Ala Mobile](https://github.com/TakotsuboChen/ala-mobile-tool) 的围场（Paddock）私有服后端：为同名 LSPosed 模块提供**计时赛圈速排行榜**、**账号体系**与 **QQ 群 bot 播报**，并带一个浏览器可用的管理端。
+
+> **契约源**：[ala-mobile-tool/docs/PADDOCK_PLAN.md](https://github.com/TakotsuboChen/ala-mobile-tool/blob/main/docs/PADDOCK_PLAN.md) —— 本仓库与模块仓库共用该计划文档作为唯一契约（API 形状、赛道表、积分公式），任何一侧变更必须两边同步。
+
+## 功能
+
+- **模块 API（`/v1`）** —— 通行证注册（申请即设密，QQ 群校验即建号）、登录（Argon2id，token 90 天滑动）、按码重置密码、个人资料与总积分、头像上传（S3）
+- **计时赛排行榜** —— 总榜 + 分赛道榜；积分公式 `round((N−rank)×100/N)`，每赛道 × 每游戏版本独立计分后累加（版本 = 独立赛季）
+- **圈速上报** —— 服务端事务内完成留档、最快圈更新与四条件 Toast 判定，判定权不在客户端
+- **QQ bot** —— QQ 官方开放平台 webhook 模式：Ed25519 验签、可编辑的消息规则引擎（触发词/条件 AND/OR/失败文案）、破纪录主动播报、注册与重置流、发送队列频控
+- **Web 管理端（`/admin`）** —— 用户/成绩/日志/设置四页：改名、重置密码、成绩增删改与重算、四组可组合筛选 + 输入跳页 + 补录可选游戏版本；业务事件日志与运行日志双视图
+- **双日志系统** —— 业务事件 `app_logs` 表（90 天保留、脱敏）+ 运行日志内存环形缓冲（不改埋点捕获全部 tracing 输出）
 
 ## 架构
 
-单二进制 `paddock-api`（axum）= 模块 API（`/v1/*`） + Web 管理端（`/admin/*`）+ QQ bot webhook（`/qq/webhook`，Ed25519 验签）。
-
-依赖：PostgreSQL（用户/成绩/积分/配置）+ Garage（头像 S3 存储）。HTTPS 反代由宿主机 1Panel openresty 承担（终结 443 → `127.0.0.1:8080`），**栈内不含 Caddy**。
-
-**线上部署**（VPS）：`deploy/docker-compose.vps.yml`（三容器 app/pg/garage，`docker compose -f` 指定）。镜像在本地构建 `docker build -t paddock-api:vN .` 后 `save | zstd | scp | load`（VPS 1.8G 内存不宜 cargo build）。
-
-```bash
-cp .env.example .env   # POSTGRES_PASSWORD + PADDOCK_ADMIN_PASS（管理端播种）
-docker compose -f deploy/docker-compose.vps.yml up -d
+```
+                    ┌─ HTTPS 443（宿主机 openresty/1Panel 反代）
+                    ▼
+  ┌───────── 127.0.0.1:8080 ─────────┐
+  │  paddock-api 单二进制（axum）     │
+  │  ├─ /v1/*    模块 API            │
+  │  ├─ /admin/* Web 管理端（SSR）    │
+  │  └─ /qq/*    bot webhook         │──▶ QQ 官方开放平台
+  └──────────┬───────────┬───────────┘
+             ▼           ▼
+      postgres:17    garage (S3)
+      用户/成绩/     头像存储
+      积分/配置      (仅内网 3900)
 ```
 
-开发（本机直跑，需本地 Postgres）：
+- **单二进制** `paddock-api`：Rust axum + sqlx（编译期 SQL 校验）+ askama SSR，musl 静态链接（`opt-level="z"` + LTO + strip），2GB 内存 VPS 友好
+- **三容器部署**：app + PostgreSQL 17 + Garage（S3 兼容对象存储）；头像 SigV4 为手写实现（~80 行），不引入 AWS SDK
+- 数据库 schema 迁移经 `sqlx::migrate!` 编译期嵌入，启动时自动执行
+
+## 快速开始（Docker Compose）
+
+```bash
+git clone https://github.com/TakotsuboChen/ala-mobile-paddock.git
+cd ala-mobile-paddock
+cp .env.example .env        # 填 POSTGRES_PASSWORD + PADDOCK_ADMIN_PASS（管理端初始密码）
+docker compose up -d        # 栈内含 Caddy（443 自动 HTTPS）；纯反代环境用 deploy/docker-compose.vps.yml
+```
+
+前置要求：Docker + Docker Compose；一个 S3 兼容存储（栈内已带 Garage）；若有外部反代（如 1Panel/openresty），用 VPS 变体并将 443 反代到 `127.0.0.1:8080`。
+
+本机开发（需本地 Postgres）：
 
 ```bash
 export DATABASE_URL=postgres://paddock:...@localhost/paddock
 cargo run -p paddock-api
 ```
 
-## 定案速记（详见 PADDOCK_PLAN.md）
+## 环境变量
 
-- 防伪：**全放行**（登录态为唯一门槛，管理端事后删）， laps 全量留档供审计。
-- 积分（v39 定案 2026-09-04）：`round((N−rank)×100/N)`——第一 100、每名次递减 100/N、虚位第 N+1 名 0、N=1 给 100（2 人=100/50）；每赛道×每版本独立，总榜=各版本独立计分后累加（版本=独立赛季）。
-- Toast 判定在服务端事务内完成，四条件取最高。
-- 身份绑定：QQ `member_openid`（官方 bot 拿不到 QQ 号）。车手 ID = `reg_seq`（建号时分配**最小未占用正整数**，2026-09-04 v4 用户定案——弃号立即回收；旧 `user_reg_seq` 序列已弃用不再被引用）。
-- 注册流 v3（2026-09-04）：申请即设密（`register-request` 收 username+password，服务端哈希存 pending_regs，**申请时不发号**）→ bot 群校验成功**即建号**（建号事务内分配车手 ID）→ 用户回模块直接登录。同名在途会话幂等恢复：密码一致返回原校验码（重弹申请指令），不一致 409。`register-verify` 端点已删。bot 指令语义：注册=消息含「申请围场通行证」且其后有 `#校验码`（提不出码**静默**防误触发）；重置密码=消息**严格等于**「我需要重置密码」，账号按发言者 `member_openid` 反查（群隔离——换群/私聊匹配不到）。
-- 头像：手写 SigV4 + Garage S3（bucket `avatars`，凭据走 GARAGE_KEY_ID/GARAGE_SECRET 环境变量）；`POST/GET /v1/me/avatar` + 公开 `GET /v1/avatar/{user_id}`；榜单 entries 带 `avatar_url` 相对路径。
-- bot 鉴权（QQ 官方 webhook，逐篇核对 2026-08）：鉴权头 `Authorization: QQBot {token}`（**非 Bearer**）；被动回复 msg_id 用事件 `d.id`（外层 id 是 `事件类型:` 前缀形态）；发送者身份在 `d.author.member_openid`（嵌套），C2C 用 `d.author.user_openid`；群被动窗 5min/5 次、单聊 60min/4 次；token 获取 `POST https://bots.qq.com/app/getAppAccessToken`；群全量消息（GROUP_MESSAGE_CREATE）需**手机QQ群内**机器人设置开启「获取群内全部消息」，开放平台开关不等于群内授权；引用回复用 `message_scene.ext` 的 `msg_idx=REFIDX_`。
-- **Web 管理端 v2**（2026-09-03）：GET 页面只渲染骨架，所有写操作走 `/admin/api/*` JSON 端点 + 前端页内弹窗（自绘 modal + fetch + 局部刷新），无 URL 路径后缀式动作。品牌名/Logo（configs 表 `site_title`/`site_logo` data URL）作用于导航栏/登录页/浏览器标签页 title+favicon。消息规则引擎（configs 表 `bot_message_rules` JSON）：规则=类型（reply/broadcast）+action（reply/reg_code/reset_password）+触发词/条件（且或组合）+成功模板+每类失败独立文案，预设 4 条完整可编辑；播报事件 `record_alltime`/`record_version` 分立（历史优先），模块上传与管理端增删改成绩统一经 `broadcast_lap_change` 触发。播报目标群（`bot_broadcast_groups`）由 webhook 收到群消息自动登记（`bot_known_groups`）+ 群名缓存（`/v2/groups/{id}/info`，11253 白名单限制时回退 openid）+ 人工覆盖名（`bot_group_names_custom`，设置页"改名"弹窗，显示优先级 自定义 > API 缓存 > 裸 openid；`POST /admin/api/bot/group-name`，空名=清除覆盖）。用户页分页（30/50/100）+ 按用户名搜索；成绩页同款分页（含**输入跳页**，renderPager 通用 v36）+ **四组可组合筛选**（用户名模糊/赛道下拉=全部16赛道/版本下拉=固定全集∪库内 distinct 显示名预处理/圈速类型=个人最快 best_laps EXISTS/全服最快 records EXISTS；空串筛选参数 empty_str_as_none 容错修复 v36；补录成绩可选版本默认 8.0.6）。combobox（自绘，fixed 定位防弹窗裁剪）用于用户/赛道选择，文字选择原生放行。JS 公共脚本块必须位于 `<main>`（content）**之前**——页内脚本顶层依赖 toast/varTag 等公共函数，顺序颠倒=整段脚本 ReferenceError 中断；模板 JS 改动用 jsdom 验证渲染产物。
-- **业务事件日志**（2026-09-04，`app_logs` 表 + 管理端"日志"页）：与 tracing 应用日志分离，只收"谁在何时做了什么"。追加写（只 INSERT），两条路径——`applog::log_event`（fire-and-forget，业务事件）与 `log_event_tx`（事务内，管理端敏感操作与动作同生共死）。覆盖：管理端登录成败/全部敏感操作、模块注册申请/登录成败/密码重置、bot 群消息/建号/重置码/发送成败、破纪录圈（普通圈不入日志防表膨胀，高频事件降采样）。管理端"日志"页支持级别（info/warn/error 徽章）+分类（管理端/认证/成绩/Bot）+关键词筛选与分页；tab 状态入 URL（`?tab=evt`，筛选/分页/刷新都停留在业务事件 tab，服务端渲染初始 active，evt 下不启动运行日志轮询）。脱敏红线：不写密码/token/secret。保留 90 天（启动时 `purge_expired` 清理）。旧 `admin_audit` 表历史行回填后已 DROP（0006 迁移）。
-- **运行日志视图**（2026-09-04，`runlog.rs` + 日志页"运行日志"tab）：全量捕获——tracing fmt 层经 `MakeWriterExt::and()` 双写 stdout 与 2000 行内存环形缓冲（`runlog::read_after` 游标增量读取，`GET /admin/api/runtime-logs?after=N`，管理端鉴权域），不改任何埋点即覆盖 tower_http/QQ payload 原文/错误堆栈。fmt 层必须 `.with_ansi(false)`（ANSI 颜色码是 tty 专属，进网页=乱码、进日志聚合=污染）。前端终端风：黑底等宽、WARN 黄/ERROR 红按词匹配着色（tracing fmt 无方括号 token）、斑马纹=**文字颜色**交替按全局 seq 奇偶（跨轮询批次稳定；CSS 声明顺序 rl-even 在 rl-warn/rl-err 之前，保证专属色优先）、2s 游标轮询+自动滚底（可暂停）+清屏+视图 3000 行上限。缓冲跨重启清零（stdout 才是持久面）。
-- 迁移注意：`sqlx::migrate!` 编译期嵌入——改/增迁移文件后必须 `touch src/main.rs` 触发重编译，否则旧二进制跑旧迁移。0005 回填 best_laps 缺行（recalc_dims 已改 upsert，管理端补录成绩的维度不再静默丢行）。
+| 变量 | 必填 | 说明 |
+|---|---|---|
+| `DATABASE_URL` | ✅ | Postgres 连接串（compose 内由服务名互连） |
+| `BIND_ADDR` | — | 监听地址，默认 `0.0.0.0:8080` |
+| `PADDOCK_ADMIN_USER` / `PADDOCK_ADMIN_PASS` | ✅ | 管理端初始账号（仅播种） |
+| `GARAGE_KEY_ID` / `GARAGE_SECRET` | ✅ | Garage S3 凭据（头像上传用） |
+| `RUST_LOG` | — | tracing 过滤，如 `paddock_api=info,tower_http=warn` |
+
+## 部署与发版
+
+线上部署（VPS，1.8G 内存，**禁止在 VPS 上 cargo build**）：本地构建镜像 → 导出 → 传输 → 载入。
+
+```bash
+# 1. 版本号改 Cargo.toml workspace.package.version → git tag vX.Y.Z
+# 2. 本地构建（tag 与 Cargo.toml 版本一致）
+docker build -t paddock-api:1.0.0 .
+# 3. 导出传输（zstd 压缩省流量）
+docker save paddock-api:1.0.0 | zstd > paddock.tar.zst
+scp paddock.tar.zst user@vps:~/
+# 4. VPS 载入并重启（compose 镜像行已钉同一版本）
+ssh user@vps 'docker load < ~/paddock.tar.zst && docker compose -f ~/paddock/docker-compose.yml up -d'
+# 5. 验证：应返回 {"status":"ok","version":"1.0.0"}
+curl https://paddock.example.com/v1/health
+```
+
+版本规则：
+
+- 服务端版本 = `Cargo.toml` 的 `workspace.package.version`，编译期注入二进制，`/v1/health` 可核
+- 每次发布打 git tag `v<semver>`，Docker 镜像 tag `paddock-api:<semver>` 与 compose 镜像行三处同步
+- 变更记录见 [CHANGELOG.md](CHANGELOG.md)（Keep a Changelog 格式）；早期部署批次（服务端 v1~v39）与 1.0.0 的关系见 CHANGELOG「版本约定」
+
+## 运维速记（详见 PADDOCK_PLAN.md）
+
+- **防伪**：全放行（登录态为唯一门槛，管理端事后删），laps 全量留档供审计
+- **身份绑定**：QQ `member_openid`（官方 bot 拿不到 QQ 号）；车手 ID = `reg_seq` 建号时分配最小未占用正整数
+- **bot 鉴权要点**：`Authorization: QQBot {token}`（非 Bearer）；被动回复用事件 `d.id`；发送者身份在 `d.author.member_openid`（群）/ `user_openid`（单聊）；群全量消息需**手机 QQ 群内**开启「获取群内全部消息」
+- **迁移注意**：`sqlx::migrate!` 编译期嵌入——改/增迁移文件后必须 `touch src/main.rs` 触发重编译，否则旧二进制跑旧迁移
+- **管理端模板**：页内 JS 公共脚本块必须位于 `<main>` 之前；模板 JS 改动用 jsdom 验证渲染产物
+- **规则防覆盖**：`load_rules` key 存在即用户数据永不回落预设；`save_rules` 覆盖审计记改前后 diff
 
 ## License
 
-Apache-2.0
+[Apache-2.0](LICENSE)
