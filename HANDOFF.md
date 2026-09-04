@@ -1,70 +1,56 @@
 # HANDOFF — 读全文再开始干活
 
-生成时间: 2026-09-04T22:08:08+08:00 · Git HEAD: `a68a4a3`（paddock 仓；模块仓 `9fe3865`）
+生成时间: 2026-09-04T23:56:42+08:00 · Git HEAD: `0ba46f2`（模块仓 `13fa6f8`）
 信任规则: [V] = 交接时已用命令验证；[?] = 仅记忆未复核，当线索对待；[X] = 已证伪，别用。
 
 ## 0. 复核（下一会话先做）
-- 锚点: paddock 仓 `main` @ `a68a4a3`（2026-09-04）；模块仓 `main` @ `9fe3865`
-- 漂移检查: `git rev-parse HEAD~1` 是否仍 = `a68a4a3`——HEAD 必是本次 handoff 提交，其 parent 才是文档记录的 SHA；不一致以 git 实际输出为准
+- 锚点: paddock `main` @ `0ba46f2`（2026-09-04，tag `v1.0.0`）；模块仓 `main` @ `13fa6f8`（tag `v1.0.3`）
+- 漂移检查: `git rev-parse HEAD~1` 是否仍 = `0ba46f2`——HEAD 必是本次 handoff 提交，其 parent 才是文档记录的 SHA；不一致以 git 实际输出为准
 - 待重探的 [?]: 见下方标记
-- 先读: `README.md`（积分公式 v39/四筛选/规则防覆盖条目）+ 模块仓 `docs/PADDOCK_PLAN.md`（契约源，本会话已同步 v4/版本键/积分 v39）
+- 先读: 模块仓 `docs/PADDOCK_PLAN.md`（契约源）+ 本仓 `CHANGELOG.md`「版本约定」
 
 ## 1. 当前目标
-**8.0.6 三端适配之服务端侧 + 四轮用户反馈落地（v36~v39 已全部上线）**：8.0.6 版本适配、成绩页筛选改造（赛道/文案/空串修复/跳页）、总榜积分改版本独立赛季、线性积分公式 v39、bot 规则防覆盖。
+**服务端 SemVer 1.0.0 收敛 + 重新部署**：从部署序号 v1~v39 收敛到语义化版本（Cargo.toml 单一事实源），CHANGELOG 回溯历史，重新构建部署上线。全部完成并验证。
 
 ## 2. 已验证状态 — 工作实际停在哪
-- [V] 线上 **v39** 运行：`/v1/health`=ok、compose 指向 `paddock-api:v39`、`docker logs` → listening on 0.0.0.0:8080
-- [V] 两切片已推送：工作 `a9ba14a`（7 文件 +256/−90）→ README `a68a4a3`
-- [V] 积分三维度线上 curl 实测：总榜 **500**（8.0.4 四赛道 400 + 8.0.6 摩纳哥 100）/版本榜 8.0.4=400、8.0.6=100——新公式+新总榜口径正确
-- [V] 空串筛选修复线上验证：`GET /admin/laps?version=&gp_index=&best=&q=` 未登录返回 303→/admin（反序列化已通过，不再 400）
-- [V] 规则防覆盖（v37）部署后核对：库内用户定制文案四条逐字未动
-- [V] jsdom 门禁 `verify-laps-v36.mjs` 21/21 OK EXIT=0（文案/赛道下拉/版本全集/goPage 带参/跳页/补录版本）
-- [?] **管理端网页端到端未验证**（凭据只有用户有）：四筛选组合、跳页、补录版本下拉、track/5?version=200150 在 UI 的显示
-- [?] **群内 bot 复测未做**（继承）：重置口令严格匹配、裸关键词静默、带码注册车手号=最小空缺
+- [V] 版本体系收敛：Cargo.toml version 0.1.0→**1.0.0**；`/v1/health` 从 `"ok"` 改返回 `{"status":"ok","version":env!("CARGO_PKG_VERSION")}`（auth_handlers.rs，模块端 grep 确认零依赖此端点）；deploy/docker-compose.vps.yml 镜像行 v1 死值→`paddock-api:1.0.0`
+- [V] CHANGELOG.md 新建（Keep a Changelog）：1.0.0 条目回溯 v1~v39 里程碑 +「版本约定」节（服务端版本=Cargo.toml，git tag/镜像tag三处同源，1.0.0≈线上v39）；LICENSE 补 Apache-2.0 本体（Cargo.toml 声明了但文件缺失）
+- [V] README 重写（中等完整版 9 节）：徽章/功能六点/架构图（单二进制+三容器+openresty反代）/Quick Start/环境变量表/部署与发版（版本规则）/运维速记 6 条（原~3600字"定案速记"压缩外移 PADDOCK_PLAN）
+- [V] 重新部署上线：docker build `paddock-api:1.0.0`→gzip 5.9MB→scp（takotsubo@8.134.50.222 -p 4142 -i ~/.ssh_paddock/id_rsa）→VPS load→线上 compose 镜像行 v39→1.0.0→up
+- [V] 线上验证：`curl /v1/health` → `{"status":"ok","version":"1.0.0"}`；`/v1/leaderboard/points`（Takotsubo 700 分）与 `/v1/leaderboard/track/5?version=200150`（摩纳哥）JSON 正常
+- [V] 提交推送：`62d0b94`（chore(release): 服务端 v1.0.0，6 文件）→ `0ba46f2`（docs: README 重写）→ tag `v1.0.0` 已 push；工作区 clean
+- [V] cargo check（全新 shell）→ EXIT=0（2 既有 warning）
+- 工作区: clean，全部已推送
 
 ### 测试/build 输出（真实退出码）
 ```
-cargo check EXIT=0（2 既有 warning：laps.rs unused_assign / server_best）
-node verify-laps-v36.mjs → 21 项 OK 0 FAIL EXIT=0
-docker build v36~v39 → 全 DONE；线上 health=ok
+cargo check → EXIT=0（2 warning：server_best overwritten 等既有）
+docker build -t paddock-api:1.0.0 . → DONE
+curl /v1/health → {"status":"ok","version":"1.0.0"}
 ```
 
 ## 3. 决策与理由
-- **积分公式 v39**（用户定案）[V]：`round((N−rank)×100/N)`——第一 100、每名次递减 100/N、虚位第 N+1 名 0、N=1 给 100（例：2 人=100/50/虚位0）。三处统一（版本榜/总榜/`/v1/me` total_points）。否决旧式 `1+(N−rank)×99/(N−1)`（用户否）。
-- **总榜=版本独立赛季**（用户定案）[V]：每 (version_code, gp_index) 独立 rank 计分后按用户 sum。两版本全赛道第一=3200。否决跨版本 min（旧 user_best CTE，用户纠正）。
-- **规则防覆盖**（用户投诉"每次部署覆盖文案"驱动）[V]：`load_rules`——key 存在（哪怕 `"[]"`/解析失败）即用户数据，永不回落 preset_rules()（预设只给从未写入的 key）；解析失败宁 bot 静默+tracing::error 保原文。`api_save_rules` 覆盖审计：`load_rules_raw`（原样库值）对照改前后 template/keyword diff + removed ids 入 app_logs。**部署本身从不写 configs**——真实覆盖链=读路径回落预设→设置页全量保存（前端整个 RULES 数组回传）固化。
-- **成绩页筛选** [V]：新增赛道下拉（版本前，16 赛道全量，默认"所有赛道"）；文案"版本（全部）"→"所有版本"、"圈速（全部）"→"所有圈速"；版本下拉=固定全集 KNOWN_VERSIONS ∪ 库内 distinct（显示名 Rust 侧预处理成 (code,name) 对——askama 不能调函数）。
-- **空串筛选** [V]：serde `Option` 只兜字段缺失不兜空串 → `empty_str_as_none`（deserialize_with）。
-- **翻页跳转** [V]：renderPager 加"跳至 [input] [跳转]"（Enter/按钮，越界不跳）——admin_base 通用函数，用户页/日志页自动受益。
-- **补录版本可选** [V]：ApiAddLap 加 version_code（默认 200150，白名单 [200150,200146]）；弹窗下拉。
-- **fetch_laps 绑定链式化** [V]：占位符动态顺延（$1 like→version→gp_index→LIMIT/OFFSET），绑定顺序与占位符序号一致；count_laps 拆分独立函数先钳页再查数据（修筛选后 pages 虚高的既有 bug）。
-- 继承：日志双轨/群名三层优先级/读取时等值迁移/两进程共用代码只用 Logger。
+- **版本=SemVer 三处同源**（用户定案）[V]：vN 是人肉部署批次混用三义（部署批次/方案定案序号/镜像tag）。收敛：Cargo.toml（编译期 env! 注入 health）+ git tag `vX.Y.Z` + 镜像 tag `paddock-api:X.Y.Z`。映射起点 **1.0.0 ≈ 线上 v39**。历史文档 vNN 记法保留不改（指方案定案），CHANGELOG「版本约定」有说明。
+- **health 改 JSON** [V]：加 version 字段让线上可核版本，治"线上跑的哪版靠翻 docker logs"。改前确认模块端不消费该端点，零破坏。
+- **README 重写取舍** [V]：契约源禁令/bot 鉴权事实速记/迁移 touch main.rs 坑——原 README 高价值资产全保留；"定案速记"压缩为运维速记 6 条，决策全文外移 PADDOCK_PLAN（point, don't embed）。
+- **migrations 0001~0007 零改动** [V]：4 位序号_描述命名与版本体系无耦合，sqlx migrate 标准形态。
+- 继承：积分 v39 线性递减 / 版本独立赛季 / 规则防覆盖 / serde Option 不兜空串 / askama 模板禁调函数。
 
 ## 4. 失败的尝试 — 不要再试
-- **serde_qs 做单测** [X]：非依赖 E0433；serde_urlencoded 也不是直接依赖——为单测加依赖不值，jsdom+线上 curl 已覆盖。测试代码已删。
-- **Python 批量替换缩进不匹配** [V]：auth_handlers.rs 的公式替换 assert 失败（多行 SQL 缩进与 leaderboard.rs 不同）——批量替换前先 grep 确认实际缩进。
-- **format! 里 `${lim}`** [X]：`$` 前缀骗不过 format! 的 `{}` 解析（expected expression found `.`）——动态占位符改用 String 拼接 push_str。
-- **`json::Value`** [X]：admin.rs 只 `use serde_json::json`（宏），类型是 `serde_json::Value`。
-- **模板里调 version_display()** [X]：askama 无任意函数调用（E0433）——预处理成字段（继承死路本轮再踩一次，因为"顺手"）。
-- **VPS cargo build** [X]（继承）：OOM——本地 build → save|gzip（~6MB）→ scp → load。
-- **jsdom location.href 赋值** [X]（继承）：真导航杀进程；vm 沙箱 stub location，sandbox 需补 URLSearchParams。
-- 继承（详见 .handoffs/20260904220808-handoff.md §4）：SSH 4142/播报模板迁移断言范围/askama `|string`/sqlx migrate 编译期嵌入/fetchMe 漏 token/sqlx HRTB/axum `:param` panic。
+- **compose 镜像行以仓内状态为准做 sed** [V]：仓内死值 v1、线上实际 v39——部署改 tag 前先 `grep` VPS 上的实际行内容，以实机为准。
+- **scp 默认 root 用户** [X]：Permission denied (publickey)——必须 `takotsubo@8.134.50.222 -p 4142 -i ~/.ssh_paddock/id_rsa -o IdentitiesOnly=yes`。
+- 继承（前向有效，详见 .handoffs/20260904233000-handoff.md §4）：VPS cargo build OOM（2GB 内存，只能本地 build→save→scp→load）/ serde Option 不兜空串（axum Query 前置反序列化 400）/ askama 模板禁调 Rust 函数（E0433）/ jsdom location.href 真导航 / ssh 4142 / 迁移改动必须 touch src/main.rs / bot 规则禁止回落覆盖。
 
 ## 5. 已知坑
-- ⚠️ **线上 configs 存的规则 JSON 库内原文未改** [V]（v37 后设计如此：等值迁移只在内存，用户手动保存即固化）。
-- ⚠️ **sqlx::migrate! 编译期嵌入** [?]（继承）——改迁移必须 touch src/main.rs。
-- ⚠️ **Garage 206 个测试/遗留头像对象** [?]（继承）——无害，无 shell/aws cli 清不掉。
-- ⚠️ **管理端网页端到端验证未做** [?]——见 §2。
-- ⚠️ **双仓赛道中文名两份硬编码** [?]（继承，契约源 PADDOCK_PLAN §5，`Shangai` 单 a）。
-- ⚠️ **排行榜无实时刷新** [?]（继承，用户拍板暂不做）。
+- ⚠️ **版本三处同步无自动校验** [?]——Cargo.toml/compose 镜像行/git tag 目前靠人工保持一致；deploy.sh（用户已认可未实施）可加一致性校验。
+- ⚠️ **Dockerfile 无版本 ARG** [?]——镜像 tag 是唯一版本标识（health 返回的是 Cargo.toml 版本），镜像本身不可追溯 build 时间；需要时加 `ARG APP_VERSION` + OCI label。
+- ⚠️ 继承：管理端网页验证未做 / 群内 bot 复测未做 / Garage 206 测试对象 / 双仓赛道中文名两份硬编码（Shangai 单 a）/ 运行日志缓冲跨重启清零（stdout 才是持久面）。
 
 ## 6. 下一步（有序）
-1. **用户网页验证 v39**：成绩页四筛选（含组合+翻页跳转保持）、补录弹窗版本选择、围场主页积分 500（模块端）。
-2. **群内 bot 复测**（继承）：「我需要重置密码」严格匹配、裸关键词静默、带码注册车手号=最小空缺、新积分播报。
-3. （可选）`deploy/deploy.sh` 固化部署链（用户认可，未实施）。
-4. （可选继承）排行榜实时刷新 / Garage 头像清理。
+1. **用户复验**（继承）：管理端成绩页四筛选+跳页+补录版本；群内 bot 复测（重置口令严格匹配、带码注册车手号）。
+2. （可选）`deploy/deploy.sh` 固化部署链 + 版本三处一致性校验（用户已认可提议）。
+3. （可选）CI/release 工作流：目前纯手动发版，可考虑 GitHub Actions tag 触发构建（当前 VPS 部署链仍需手动 scp）。
 
 ## 7. 留给用户的开放问题
-- 播报受主动消息额度限制（未认证约 4 条/月/群）：接受 / 申请认证？
-- 重构范围清单待定（用户提过"下个版本重构模块和服务端一堆东西"）。
-- 计时赛积分卡"暂无"与"加载失败"是否区分显示？
+- 官版 8.0.4 用户兼容策略（模块仓问题，影响服务端 version_display 支持范围）。
+- 播报主动消息额度（约 4 条/月/群）：接受 / 申请认证？
