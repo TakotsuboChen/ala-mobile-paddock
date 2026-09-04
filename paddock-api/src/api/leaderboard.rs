@@ -55,7 +55,7 @@ pub async fn points_board(
                    SELECT u.id AS user_id, u.reg_seq AS reg_seq, u.username AS username,
                           (CASE WHEN u.avatar_key IS NOT NULL THEN '/v1/avatar/'||u.id END) AS avatar_url,
                           (CASE WHEN n_in_track = 1 THEN 100
-                                ELSE round((n_in_track - rank_in_track)::numeric * 100 / n_in_track)
+                                ELSE round((n_in_track + 1 - rank_in_track)::numeric * 100 / n_in_track)
                            END)::bigint AS points
                    FROM per_track p JOIN users u ON u.id = p.user_id"#,
             )
@@ -92,7 +92,7 @@ pub async fn points_board(
                    SELECT u.id AS user_id, u.reg_seq AS reg_seq, u.username AS username,
                           (CASE WHEN u.avatar_key IS NOT NULL THEN '/v1/avatar/'||u.id END) AS avatar_url,
                           (CASE WHEN n_in_track = 1 THEN 100
-                                ELSE round((n_in_track - rank_in_track)::numeric * 100 / n_in_track)
+                                ELSE round((n_in_track + 1 - rank_in_track)::numeric * 100 / n_in_track)
                            END)::bigint AS points
                    FROM per_track p JOIN users u ON u.id = p.user_id"#,
             )

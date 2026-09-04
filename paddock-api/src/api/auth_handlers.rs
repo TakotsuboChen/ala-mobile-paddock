@@ -312,18 +312,20 @@ pub async fn me(
     let Some((username, reg_seq, has_avatar)) = row else {
         return Err(ApiError::unauthorized("账号不存在，请重新登录"));
     };
-    // 积分口径与 leaderboard::points_board 总榜分支一致（版本=独立赛季累加 + v39 线性公式；复制 CTE 加 user 过滤）
+    // 积分口径与 leaderboard::points_board 总榜分支一致（版本=独立赛季累加 + v40 线性公式）。
+    // ⚠️ 窗口函数必须基于全量 best_laps 计算再过滤用户——若把 WHERE user_id 放进
+    // per_track CTE，n_in_track 恒为 1，每人每赛道都走 100 分特判，与总榜口径脱节。
     let total_points: i64 = sqlx::query_scalar(
         r#"WITH per_track AS (
              SELECT user_id, version_code, gp_index, lap_ms,
                     rank() OVER (PARTITION BY version_code, gp_index ORDER BY lap_ms ASC) AS rank_in_track,
                     count(*) OVER (PARTITION BY version_code, gp_index) AS n_in_track
-             FROM best_laps WHERE user_id = $1
+             FROM best_laps
            )
            SELECT coalesce(sum(CASE WHEN n_in_track = 1 THEN 100
-                                    ELSE round((n_in_track - rank_in_track)::numeric * 100 / n_in_track)
+                                    ELSE round((n_in_track + 1 - rank_in_track)::numeric * 100 / n_in_track)
                                END), 0)::bigint
-           FROM per_track"#,
+           FROM per_track WHERE user_id = $1"#,
     )
     .bind(user_id)
     .fetch_one(&state.pool)
