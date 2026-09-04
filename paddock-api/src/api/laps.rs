@@ -297,6 +297,7 @@ pub async fn authenticate(state: &AppState, headers: &HeaderMap) -> Result<Uuid,
 /// 游戏 versionCode → 版本名（管理端展示用；新版本上市时在此追加映射）。
 pub fn version_display(version_code: i32) -> String {
     match version_code {
+        200150 => "8.0.6".to_string(),
         200146 => "8.0.4".to_string(),
         other => format!("code {other}"),
     }

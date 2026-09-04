@@ -118,8 +118,12 @@ struct LapsTemplate {
     q: String,
     q_json: String,
     version: i64,   // 0 = 全部（select 空值回落）
+    gp_index: i64,  // -1 = 全部（select 空值回落）
     best: String,
-    versions: Vec<i64>,
+    /// (version_code, 显示名) 对——askama 模板不能调 Rust 函数，显示名预处理好
+    versions: Vec<(i64, String)>,
+    /// (gp_index, 赛道中文名) 对
+    tracks: Vec<(i64, String)>,
     page: i64,
     size: i64,
     pages: i64,
@@ -127,13 +131,34 @@ struct LapsTemplate {
     usernames_json: String,
 }
 
+/// 空串 → None 的 Option 反序列化。表单下拉"全部"提交的是 `?version=`（空串），
+/// serde 的 Option 只兜字段缺失不兜空值，直接 i32 解析报
+/// "Failed to deserialize query string: version: cannot parse integer from empty string"。
+fn empty_str_as_none<'de, D, T>(de: D) -> Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: serde::Deserialize<'de> + std::str::FromStr,
+{
+    let s: Option<String> = Option::deserialize(de)?;
+    match s.as_deref() {
+        None | Some("") => Ok(None),
+        Some(v) => v
+            .parse::<T>()
+            .map(Some)
+            .map_err(|_| serde::de::Error::custom("invalid integer")),
+    }
+}
+
 /// 分页参数（用户页/成绩页共用）：页大小 30/50/100。
-/// 成绩页追加筛选：version（版本号，None=全部）、best（personal/server，None=全部）。
+/// 成绩页追加筛选：version（版本号）、gp_index（赛道）、best（personal/server），均 None=全部。
 #[derive(Deserialize, Clone)]
 struct PageQuery {
     #[serde(default)]
     q: String,
+    #[serde(default, deserialize_with = "empty_str_as_none")]
     version: Option<i32>,
+    #[serde(default, deserialize_with = "empty_str_as_none")]
+    gp_index: Option<i16>,
     best: Option<String>,
     #[serde(default = "default_page")]
     page: i64,
@@ -202,24 +227,68 @@ async fn fetch_users(pool: &PgPool, q: &str, size: i64, offset: i64) -> (Vec<Use
     (rows, total)
 }
 
-/// 成绩列表查询（成绩页共用）。三个筛选可组合：
+/// 筛选条件下的成绩总数（与 fetch_laps 同条件，供分页钳制）。
+async fn count_laps(
+    pool: &PgPool,
+    qname: &str,
+    version: Option<i32>,
+    gp_index: Option<i16>,
+    best: Option<&str>,
+) -> i64 {
+    let like = format!("%{qname}%");
+    let mut where_sql = String::from("u.username LIKE $1");
+    let mut next_ph = 2usize;
+    if version.is_some() {
+        where_sql.push_str(&format!(" AND l.version_code = ${next_ph}"));
+        next_ph += 1;
+    }
+    if gp_index.is_some() {
+        where_sql.push_str(&format!(" AND l.gp_index = ${next_ph}"));
+        next_ph += 1;
+    }
+    match best {
+        Some("personal") => where_sql.push_str(
+            " AND EXISTS (SELECT 1 FROM best_laps b WHERE b.user_id=l.user_id              AND b.gp_index=l.gp_index AND b.version_code=l.version_code AND b.lap_ms=l.lap_ms)",
+        ),
+        Some("server") => where_sql.push_str(
+            " AND EXISTS (SELECT 1 FROM records r WHERE r.gp_index=l.gp_index              AND ((r.kind='alltime' AND r.lap_ms=l.lap_ms AND r.user_id=l.user_id)                OR (r.kind='version' AND r.version_code=l.version_code                    AND r.lap_ms=l.lap_ms AND r.user_id=l.user_id)))",
+        ),
+        _ => {}
+    }
+    let sql = format!("SELECT count(*) FROM laps l JOIN users u ON u.id=l.user_id WHERE {where_sql}");
+    let mut q = sqlx::query_scalar::<_, i64>(&sql);
+    q = q.bind(&like);
+    if let Some(v) = version { q = q.bind(v); }
+    if let Some(g) = gp_index { q = q.bind(g); }
+    q.fetch_one(pool).await.unwrap_or(0)
+}
+
+/// 成绩列表查询（成绩页共用）。四个筛选可组合：
 /// - qname：用户名模糊（LIKE）
 /// - version：版本号精确（None=全部）
+/// - gp_index：赛道精确（None=全部）
 /// - best："personal"=该用户该赛道该版本的个人最快（best_laps 命中）；
 ///   "server"=当前全服纪录（records alltime/version 命中）。None=全部。
-/// 动态 WHERE 拼接：无筛选的条件段用 TRUE 占位，参数化绑定无注入面。
+/// 动态 WHERE 拼接：占位符按筛选存在与否顺延（$2..），参数化绑定无注入面。
 async fn fetch_laps(
     pool: &PgPool,
     qname: &str,
     version: Option<i32>,
+    gp_index: Option<i16>,
     best: Option<&str>,
     size: i64,
     offset: i64,
 ) -> (Vec<LapRow>, i64) {
     let like = format!("%{qname}%");
     let mut where_sql = String::from("u.username LIKE $1");
+    let mut next_ph = 2usize;
     if version.is_some() {
-        where_sql.push_str(" AND l.version_code = $2");
+        where_sql.push_str(&format!(" AND l.version_code = ${next_ph}"));
+        next_ph += 1;
+    }
+    if gp_index.is_some() {
+        where_sql.push_str(&format!(" AND l.gp_index = ${next_ph}"));
+        next_ph += 1;
     }
     match best {
         Some("personal") => where_sql.push_str(
@@ -237,43 +306,45 @@ async fn fetch_laps(
     let count_sql = format!(
         "SELECT count(*) FROM laps l JOIN users u ON u.id=l.user_id WHERE {where_sql}"
     );
-    let total: i64 = if let Some(v) = version {
-        sqlx::query_scalar(&count_sql).bind(&like).bind(v).fetch_one(pool).await.unwrap_or(0)
-    } else {
-        sqlx::query_scalar(&count_sql).bind(&like).fetch_one(pool).await.unwrap_or(0)
+    // 绑定顺序必须与占位符序号一致：$1 like → version → gp_index
+    let total: i64 = {
+        let mut q = sqlx::query_scalar::<_, i64>(&count_sql);
+        q = q.bind(&like);
+        if let Some(v) = version { q = q.bind(v); }
+        if let Some(g) = gp_index { q = q.bind(g); }
+        q.fetch_one(pool).await.unwrap_or(0)
     };
-    let select_sql = format!(
+    let mut select_sql = String::from(
         "SELECT l.id, u.username, l.gp_index, l.version_code, l.lap_ms, l.created_at \
-         FROM laps l JOIN users u ON u.id=l.user_id \
-         WHERE {where_sql} ORDER BY l.created_at DESC LIMIT $LIM OFFSET $OFF"
+         FROM laps l JOIN users u ON u.id=l.user_id WHERE ",
     );
-    // 参数序号动态确定：version 绑定时占用 $2，LIMIT/OFFSET 顺延
-    let (lim_ph, off_ph) = if version.is_some() { ("$3", "$4") } else { ("$2", "$3") };
-    let select_sql = select_sql.replace("$LIM", lim_ph).replace("$OFF", off_ph);
-    let rows: Vec<LapRow> = if let Some(v) = version {
-        sqlx::query_as(&select_sql)
-            .bind(&like).bind(v).bind(size).bind(offset)
-            .fetch_all(pool).await.unwrap_or_default()
-    } else {
-        sqlx::query_as(&select_sql)
-            .bind(&like).bind(size).bind(offset)
-            .fetch_all(pool).await.unwrap_or_default()
-    }
-    .into_iter()
-    .map(
-        |(id, name, gp, ver, ms, created): (Uuid, String, i16, i32, i32, chrono::DateTime<Utc>)| {
-            LapRow {
-                id: id.to_string(),
-                username: name,
-                track: track_display_name(gp).to_string(),
-                version_name: crate::api::laps::version_display(ver),
-                lap_display: crate::api::leaderboard::format_lap_ms(ms),
-                lap_ms_raw: ms,
-                created: bj_time(created).format("%Y-%m-%d %H:%M:%S").to_string(),
-            }
-        },
-    )
-    .collect();
+    select_sql.push_str(&where_sql);
+    select_sql.push_str(&format!(
+        " ORDER BY l.created_at DESC LIMIT ${} OFFSET ${}",
+        next_ph,
+        next_ph + 1
+    ));
+    let mut q = sqlx::query_as::<_, (Uuid, String, i16, i32, i32, chrono::DateTime<chrono::Utc>)>(&select_sql);
+    q = q.bind(&like);
+    if let Some(v) = version { q = q.bind(v); }
+    if let Some(g) = gp_index { q = q.bind(g); }
+    let rows: Vec<LapRow> = q
+        .bind(size)
+        .bind(offset)
+        .fetch_all(pool)
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .map(|(id, name, gp, ver, ms, created)| LapRow {
+            id: id.to_string(),
+            username: name,
+            track: track_display_name(gp).to_string(),
+            version_name: crate::api::laps::version_display(ver),
+            lap_display: crate::api::leaderboard::format_lap_ms(ms),
+            lap_ms_raw: ms,
+            created: bj_time(created).format("%Y-%m-%d %H:%M:%S").to_string(),
+        })
+        .collect();
     (rows, total)
 }
 
@@ -462,22 +533,15 @@ async fn laps_page(
     if require_admin(&state, &headers).await.is_none() {
         return Redirect::to("/admin").into_response();
     }
-    let like = format!("%{}%", pq.q);
     // 圈速类型筛选规范化：非法值一律回落"全部"
     let best = match pq.best.as_deref() {
         Some("personal") | Some("server") => pq.best.clone().unwrap_or_default(),
         _ => String::new(),
     };
-    let total: i64 = sqlx::query_scalar(
-        "SELECT count(*) FROM laps l JOIN users u ON u.id=l.user_id WHERE u.username LIKE $1",
-    )
-    .bind(&like)
-    .fetch_one(&state.pool)
-    .await
-    .unwrap_or(0);
-    clamp_page(&mut pq, total);
-    let tracks: Vec<(i16, String)> = (0..16)
-        .map(|i| (i, track_display_name(i).to_string()))
+    // 赛道筛选规范化：越界回落"全部"（URL 手改负数/超界的防御）
+    let gp_index = pq.gp_index.filter(|g| (0..16).contains(g));
+    let tracks: Vec<(i64, String)> = (0..16)
+        .map(|i| (i as i64, track_display_name(i).to_string()))
         .collect();
     // ⚠️ query_scalar 输出类型此处必须是 String 标量——曾被 .map(|(u,): (String,)|) 标注
     // 反推成元组导致运行时解码失败（下拉空白）。保持无标注，交给标量上下文推断。
@@ -486,33 +550,54 @@ async fn laps_page(
             .fetch_all(&state.pool)
             .await
             .unwrap_or_default();
-    // 版本筛选数据源：库中实际出现过的版本号（升序），模板渲染为下拉
-    let versions: Vec<i64> = sqlx::query_scalar(
+    // 版本筛选数据源：固定全集 ∪ 库中实际出现过的版本号（升序去重）。
+    // 固定全集保证新版本（如 8.0.6）零成绩时也能筛选；历史版本来自库。
+    // 显示名在此预处理（askama 模板不能调函数，HANDOFF 死路 E0433）。
+    const KNOWN_VERSIONS: [i32; 2] = [200146, 200150];
+    let mut codes: Vec<i32> = sqlx::query_scalar::<_, i32>(
         "SELECT DISTINCT version_code FROM laps ORDER BY version_code",
     )
     .fetch_all(&state.pool)
     .await
     .unwrap_or_default();
+    codes.extend_from_slice(&KNOWN_VERSIONS);
+    codes.sort_unstable();
+    codes.dedup();
+    let versions: Vec<(i64, String)> = codes
+        .into_iter()
+        .map(|v| {
+            let n = crate::api::laps::version_display(v);
+            (v as i64, n)
+        })
+        .collect();
     let tracks_json =
         serde_json::to_string(&tracks).unwrap_or_else(|_| "[]".into());
     let usernames_json =
         serde_json::to_string(&usernames).unwrap_or_else(|_| "[]".into());
     let q_json = serde_json::to_string(&pq.q).unwrap_or_else(|_| "\"\"".into());
-    let (rows, _) = fetch_laps(
+    // 先按真实筛选条件 count 钳页（此前用不带筛选的粗算，筛选后 pages 虚高），
+    // 再查当页数据——clamp 生效时 offset 才正确。
+    let filtered_total = count_laps(&state.pool, &pq.q, pq.version, gp_index, if best.is_empty() { None } else { Some(best.as_str()) }).await;
+    clamp_page(&mut pq, filtered_total);
+    let (rows, total) = fetch_laps(
         &state.pool,
         &pq.q,
         pq.version,
+        gp_index,
         if best.is_empty() { None } else { Some(best.as_str()) },
         pq.size,
         (pq.page - 1) * pq.size,
     )
     .await;
+    debug_assert_eq!(total, filtered_total);
     let body = LapsTemplate {
         rows,
         q: pq.q.clone(),
         q_json,
         version: pq.version.unwrap_or(0) as i64,
+        gp_index: gp_index.map_or(-1, |g| g as i64),
         best,
+        tracks: tracks.clone(),
         versions,
         page: pq.page,
         size: pq.size,
@@ -667,7 +752,7 @@ async fn logs_page(
     .fetch_one(&state.pool)
     .await
     .unwrap_or(0);
-    let mut pq = PageQuery { q: lq.q.clone(), version: None, best: None, page: lq.page, size: lq.size };
+    let mut pq = PageQuery { q: lq.q.clone(), version: None, gp_index: None, best: None, page: lq.page, size: lq.size };
     clamp_page(&mut pq, total);
     let (rows, _) = fetch_logs(
         &state.pool, &lq.q, &lq.level, &lq.cat, pq.size, (pq.page - 1) * pq.size,
@@ -969,9 +1054,16 @@ async fn api_delete_lap(
 struct ApiAddLap {
     username: String,
     gp_index: i16,
+    /// 补录记账版本（默认 200150 = 8.0.6 当前版本；前端下拉可选历史版本）
+    #[serde(default = "default_add_version")]
+    version_code: i32,
     min: i32,
     sec: i32,
     ms: i32,
+}
+
+fn default_add_version() -> i32 {
+    200150
 }
 
 /// 添加成绩（管理端补录）： laps 全量留档 → 重算该维度 best_laps/records。
@@ -986,6 +1078,9 @@ async fn api_add_lap(
     let username = f.username.trim();
     if !(0..16).contains(&f.gp_index) {
         return api_res(false, "赛道越界");
+    }
+    if ![200150, 200146].contains(&f.version_code) {
+        return api_res(false, "版本非法（仅支持 8.0.6 / 8.0.4）");
     }
     if !(0..=59).contains(&f.min) || !(0..=59).contains(&f.sec) || !(0..=999).contains(&f.ms) {
         return api_res(false, "时间分段非法（分 0–59，秒 0–59，毫秒 0–999）");
@@ -1011,18 +1106,18 @@ async fn api_add_lap(
     .bind(Uuid::now_v7())
     .bind(user_id)
     .bind(f.gp_index)
-    .bind(200146) // 管理端补录按当前游戏版本 8.0.4 记账
+    .bind(f.version_code) // 管理端补录按所选版本记账（默认 8.0.6）
     .bind(lap_ms)
     .execute(&mut *tx)
     .await
     .map(|r| r.rows_affected())
     .unwrap_or(0);
     if sqlx::query_scalar::<_, i64>("SELECT count(*) FROM laps WHERE user_id=$1 AND gp_index=$2 AND version_code=$3 AND lap_ms=$4")
-        .bind(user_id).bind(f.gp_index).bind(200146i32).bind(lap_ms)
+        .bind(user_id).bind(f.gp_index).bind(f.version_code).bind(lap_ms)
         .fetch_one(&mut *tx).await.unwrap_or(0) == 0 {
         return api_res(false, "写入成绩失败");
     }
-    if let Err(e) = recalc_dims(&mut tx, user_id, f.gp_index, 200146).await {
+    if let Err(e) = recalc_dims(&mut tx, user_id, f.gp_index, f.version_code).await {
         return api_res(false, format!("重算失败：{e}"));
     }
     crate::applog::log_event_tx(
@@ -1032,7 +1127,7 @@ async fn api_add_lap(
     ).await;
     tx.commit().await.ok();
     // 补录成绩若刷新纪录同样播报（与模块上传同链路）
-    crate::qq_bot::broadcast_lap_change(&state, f.gp_index, 200146, lap_ms).await;
+    crate::qq_bot::broadcast_lap_change(&state, f.gp_index, f.version_code, lap_ms).await;
     api_res(
         true,
         format!(
@@ -1459,9 +1554,42 @@ async fn api_save_rules(
             }
         }
     }
+    // 覆盖审计：记录改前→改后的 id/keyword/template 对照。消息规则是全量覆盖写
+    // （前端整个 RULES 数组回传），曾发生"打开设置页→保存任意项→用户定制被
+    // 预设固化覆盖"的事故——留旧值摘要可事后追责/恢复。
+    let old_rules = crate::qq_bot::load_rules_raw(&state.pool).await;
+    let diff: Vec<serde_json::Value> = f
+        .rules
+        .iter()
+        .filter_map(|new_r| {
+            match old_rules.iter().find(|o| o.id == new_r.id) {
+                Some(o) if o.template != new_r.template || o.keyword != new_r.keyword => {
+                    Some(json!({
+                        "id": new_r.id,
+                        "old_template": o.template,
+                        "new_template": new_r.template,
+                        "old_keyword": o.keyword,
+                        "new_keyword": new_r.keyword,
+                    }))
+                }
+                Some(_) => None,
+                None => Some(json!({"id": new_r.id, "added": true, "template": new_r.template})),
+            }
+        })
+        .collect();
+    let removed: Vec<&String> = old_rules
+        .iter()
+        .filter(|o| !f.rules.iter().any(|n| n.id == o.id))
+        .map(|o| &o.id)
+        .collect();
     match crate::qq_bot::save_rules(&state.pool, &f.rules).await {
         Ok(()) => {
-            audit(&state.pool, "save_bot_rules", json!({"count": f.rules.len()})).await;
+            audit(
+                &state.pool,
+                "save_bot_rules",
+                json!({"count": f.rules.len(), "changed": diff, "removed": removed}),
+            )
+            .await;
             api_res(true, format!("已保存 {} 条消息规则", f.rules.len()))
         }
         Err(e) => api_res(false, format!("保存失败：{e}")),
@@ -1668,3 +1796,4 @@ pub fn router() -> Router<App> {
         .route("/api/runtime-logs", get(api_runtime_logs))
         .route("/api/brand", post(api_save_brand))
 }
+

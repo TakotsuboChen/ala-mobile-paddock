@@ -171,12 +171,21 @@ fn preset_rules() -> Vec<BotRule> {
 /// 旧 keyword 格式（无 conditions）自动迁移为 conditions。
 pub async fn load_rules(pool: &PgPool) -> Vec<BotRule> {
     let raw = get_cfg(pool, RULES_CFG_KEY).await;
+    let key_exists = raw.as_ref().is_some_and(|s| !s.is_empty());
+    // ⚠️ key 存在即用户数据——哪怕是 "[]"（显式保存的空表）或解析失败，
+    // 都绝不回落 preset_rules()。任何"读→展示→保存"链路一旦混入预设，
+    // 下一次保存就会把用户定制固化覆盖掉（v35 前的实际事故：用户改的文案
+    // 每次部署后打开设置页再保存即被覆盖回默认）。
     let mut rules: Vec<BotRule> = match raw {
-        // "[]"（旧版面板曾保存过空表）也按未配置处理，保证预设永远可见
-        Some(s) if !s.is_empty() => serde_json::from_str(&s).unwrap_or_default(),
+        Some(s) if !s.is_empty() => serde_json::from_str(&s).unwrap_or_else(|e| {
+            // 解析失败不静默换预设：宁可空跑（bot 静默）也保住库里原文可人工修
+            tracing::error!("bot_message_rules JSON 解析失败（保留原文不回落预设）: {e}");
+            Vec::new()
+        }),
         _ => Vec::new(),
     };
-    if rules.is_empty() {
+    if rules.is_empty() && !key_exists {
+        // 仅当 key 从未写入过（首次部署）才给预设；"[]"是用户显式数据，尊重
         rules = preset_rules();
     }
     for r in &mut rules {
@@ -215,6 +224,16 @@ pub async fn load_rules(pool: &PgPool) -> Vec<BotRule> {
 /// 规则列表 → JSON 字符串（设置页模板注入用）。
 pub async fn load_rules_json(pool: &PgPool) -> String {
     serde_json::to_string(&load_rules(pool).await).unwrap_or_else(|_| "[]".into())
+}
+
+/// 库中原样规则（不跑等值迁移、不回落预设）——审计用：保存前后对照的是
+/// 库里真实旧值而非迁移后的展示值。
+pub async fn load_rules_raw(pool: &PgPool) -> Vec<BotRule> {
+    let raw = get_cfg(pool, RULES_CFG_KEY).await;
+    match raw {
+        Some(s) if !s.is_empty() => serde_json::from_str(&s).unwrap_or_default(),
+        _ => Vec::new(),
+    }
 }
 
 /// 全量保存规则。多群播报时拒绝 @QQ 群用户名 变量（该变量只在被动回复场景有数据源）。

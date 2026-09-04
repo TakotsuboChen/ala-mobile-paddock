@@ -1,5 +1,5 @@
 //! 排行榜查询：积分总榜/版本榜 + 赛道榜。
-//! 积分公式（定案）：score = round(1 + (N−rank)×99/(N−1))，N=1 → 100。
+//! 积分公式（v39 定案）：score = round((N−rank)×100/N)，第一 100、每名次递减 100/N、虚位第 N+1 名 0 分；N=1 → 100。
 //! 总榜跨版本累加：对用户在所有版本 best_laps 的每赛道最佳名次积分求和
 //! （同赛道多版本取该用户跨版本的最好成绩参与版本排名——定案口径：版本榜看该版本，
 //! 总榜看"每个用户在该赛道的绝对最佳"，以 best of best 参与总榜排名）。
@@ -55,7 +55,7 @@ pub async fn points_board(
                    SELECT u.id AS user_id, u.reg_seq AS reg_seq, u.username AS username,
                           (CASE WHEN u.avatar_key IS NOT NULL THEN '/v1/avatar/'||u.id END) AS avatar_url,
                           (CASE WHEN n_in_track = 1 THEN 100
-                                ELSE round(1 + (n_in_track - rank_in_track)::numeric * 99 / (n_in_track - 1))
+                                ELSE round((n_in_track - rank_in_track)::numeric * 100 / n_in_track)
                            END)::bigint AS points
                    FROM per_track p JOIN users u ON u.id = p.user_id"#,
             )
@@ -76,22 +76,23 @@ pub async fn points_board(
             .collect()
         }
         None => {
-            // 总榜：每用户每赛道的跨版本最佳成绩 → 参与该赛道总排名 → 求和
+            // 总榜（语义定案 2026-09-04）：每个游戏版本是独立赛季——同一用户在
+            // 8.0.4 和 8.0.6 各拿全赛道第一 = 1600+1600 = 3200 分。积分按
+            // (user, version, track) 维度独立计算后按用户累加，不跨版本取最快。
             sqlx::query_as::<_, PointsEntry>(
-                r#"WITH user_best AS (
-                     SELECT user_id, gp_index, min(lap_ms) AS lap_ms
-                     FROM best_laps GROUP BY user_id, gp_index
-                   ),
-                   per_track AS (
-                     SELECT user_id, gp_index, lap_ms,
-                            rank() OVER (PARTITION BY gp_index ORDER BY lap_ms ASC) AS rank_in_track,
-                            count(*) OVER (PARTITION BY gp_index) AS n_in_track
-                     FROM user_best
+                r#"WITH per_track AS (
+                     SELECT user_id,
+                            gp_index,
+                            version_code,
+                            lap_ms,
+                            rank() OVER (PARTITION BY version_code, gp_index ORDER BY lap_ms ASC) AS rank_in_track,
+                            count(*) OVER (PARTITION BY version_code, gp_index) AS n_in_track
+                     FROM best_laps
                    )
                    SELECT u.id AS user_id, u.reg_seq AS reg_seq, u.username AS username,
                           (CASE WHEN u.avatar_key IS NOT NULL THEN '/v1/avatar/'||u.id END) AS avatar_url,
                           (CASE WHEN n_in_track = 1 THEN 100
-                                ELSE round(1 + (n_in_track - rank_in_track)::numeric * 99 / (n_in_track - 1))
+                                ELSE round((n_in_track - rank_in_track)::numeric * 100 / n_in_track)
                            END)::bigint AS points
                    FROM per_track p JOIN users u ON u.id = p.user_id"#,
             )

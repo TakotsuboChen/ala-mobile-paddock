@@ -1,12 +1,16 @@
 <h2>成绩管理</h2>
 <form method="get" action="/admin/laps" style="margin-bottom:.8rem;display:flex;gap:.6rem;align-items:center;flex-wrap:wrap">
   <input name="q" value="{{ q }}" placeholder="用户名" style="padding:.4rem;border-radius:6px;border:1px solid #444;background:#2a2a2c;color:#eee">
+  <select name="gp_index" style="padding:.4rem;border-radius:6px;border:1px solid #444;background:#2a2a2c;color:#eee">
+    <option value="">所有赛道</option>
+    {% for t in tracks %}<option value="{{ t.0 }}" {% if gp_index == t.0 %}selected{% endif %}>{{ t.1 }}</option>{% endfor %}
+  </select>
   <select name="version" style="padding:.4rem;border-radius:6px;border:1px solid #444;background:#2a2a2c;color:#eee">
-    <option value="">版本（全部）</option>
-    {% for v in versions %}<option value="{{ v }}" {% if version == *v %}selected{% endif %}>{{ v }}</option>{% endfor %}
+    <option value="">所有版本</option>
+    {% for v in versions %}<option value="{{ v.0 }}" {% if version == v.0 %}selected{% endif %}>{{ v.1 }}</option>{% endfor %}
   </select>
   <select name="best" style="padding:.4rem;border-radius:6px;border:1px solid #444;background:#2a2a2c;color:#eee">
-    <option value="">圈速（全部）</option>
+    <option value="">所有圈速</option>
     <option value="personal" {% if best == "personal" %}selected{% endif %}>个人最快</option>
     <option value="server" {% if best == "server" %}selected{% endif %}>全服最快</option>
   </select>
@@ -40,9 +44,11 @@ function goPage(p, s){
   const f = document.querySelector('form[action="/admin/laps"]');
   const qs = new URLSearchParams();
   const qv = f?.querySelector('input[name=q]')?.value.trim() || '';
+  const tv = f?.querySelector('select[name=gp_index]')?.value || '';
   const vv = f?.querySelector('select[name=version]')?.value || '';
   const bv = f?.querySelector('select[name=best]')?.value || '';
   if (qv) qs.set('q', qv);
+  if (tv !== '') qs.set('gp_index', tv);
   if (vv) qs.set('version', vv);
   if (bv) qs.set('best', bv);
   location.href = `/admin/laps?page=${p}&size=${s}&${qs.toString()}`;
@@ -97,6 +103,10 @@ function lapAdd(){
     body: `
       <label>用户</label><div id="m-user"></div>
       <label>赛道</label><div id="m-track"></div>
+      <label>版本</label><select id="m-version" style="width:100%;padding:.4rem;border-radius:6px;border:1px solid #444;background:#2a2a2c;color:#eee">
+        <option value="200150" selected>8.0.6</option>
+        <option value="200146">8.0.4</option>
+      </select>
       <label>圈速</label>${lapInputs()}`,
     okText: '添加',
     onOk: async (mask)=>{
@@ -105,6 +115,7 @@ function lapAdd(){
       const body = {
         username: userC.value,
         gp_index: gp,
+        version_code: parseInt(document.getElementById('m-version').value, 10),
         ...readLap(mask)
       };
       const msg = await api('/admin/api/laps/add', body);
