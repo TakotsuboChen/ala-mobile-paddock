@@ -117,6 +117,9 @@ struct LapsTemplate {
     rows: Vec<LapRow>,
     q: String,
     q_json: String,
+    version: i64,   // 0 = 全部（select 空值回落）
+    best: String,
+    versions: Vec<i64>,
     page: i64,
     size: i64,
     pages: i64,
@@ -125,10 +128,13 @@ struct LapsTemplate {
 }
 
 /// 分页参数（用户页/成绩页共用）：页大小 30/50/100。
+/// 成绩页追加筛选：version（版本号，None=全部）、best（personal/server，None=全部）。
 #[derive(Deserialize, Clone)]
 struct PageQuery {
     #[serde(default)]
     q: String,
+    version: Option<i32>,
+    best: Option<String>,
     #[serde(default = "default_page")]
     page: i64,
     #[serde(default = "default_size")]
@@ -196,25 +202,63 @@ async fn fetch_users(pool: &PgPool, q: &str, size: i64, offset: i64) -> (Vec<Use
     (rows, total)
 }
 
-async fn fetch_laps(pool: &PgPool, qname: &str, size: i64, offset: i64) -> (Vec<LapRow>, i64) {
+/// 成绩列表查询（成绩页共用）。三个筛选可组合：
+/// - qname：用户名模糊（LIKE）
+/// - version：版本号精确（None=全部）
+/// - best："personal"=该用户该赛道该版本的个人最快（best_laps 命中）；
+///   "server"=当前全服纪录（records alltime/version 命中）。None=全部。
+/// 动态 WHERE 拼接：无筛选的条件段用 TRUE 占位，参数化绑定无注入面。
+async fn fetch_laps(
+    pool: &PgPool,
+    qname: &str,
+    version: Option<i32>,
+    best: Option<&str>,
+    size: i64,
+    offset: i64,
+) -> (Vec<LapRow>, i64) {
     let like = format!("%{qname}%");
-    let total: i64 =
-        sqlx::query_scalar("SELECT count(*) FROM laps l JOIN users u ON u.id=l.user_id WHERE u.username LIKE $1")
-            .bind(&like)
-            .fetch_one(pool)
-            .await
-            .unwrap_or(0);
-    let rows: Vec<LapRow> = sqlx::query_as(
+    let mut where_sql = String::from("u.username LIKE $1");
+    if version.is_some() {
+        where_sql.push_str(" AND l.version_code = $2");
+    }
+    match best {
+        Some("personal") => where_sql.push_str(
+            " AND EXISTS (SELECT 1 FROM best_laps b WHERE b.user_id=l.user_id \
+             AND b.gp_index=l.gp_index AND b.version_code=l.version_code AND b.lap_ms=l.lap_ms)",
+        ),
+        Some("server") => where_sql.push_str(
+            " AND EXISTS (SELECT 1 FROM records r WHERE r.gp_index=l.gp_index \
+             AND ((r.kind='alltime' AND r.lap_ms=l.lap_ms AND r.user_id=l.user_id) \
+               OR (r.kind='version' AND r.version_code=l.version_code \
+                   AND r.lap_ms=l.lap_ms AND r.user_id=l.user_id)))",
+        ),
+        _ => {}
+    }
+    let count_sql = format!(
+        "SELECT count(*) FROM laps l JOIN users u ON u.id=l.user_id WHERE {where_sql}"
+    );
+    let total: i64 = if let Some(v) = version {
+        sqlx::query_scalar(&count_sql).bind(&like).bind(v).fetch_one(pool).await.unwrap_or(0)
+    } else {
+        sqlx::query_scalar(&count_sql).bind(&like).fetch_one(pool).await.unwrap_or(0)
+    };
+    let select_sql = format!(
         "SELECT l.id, u.username, l.gp_index, l.version_code, l.lap_ms, l.created_at \
          FROM laps l JOIN users u ON u.id=l.user_id \
-         WHERE u.username LIKE $1 ORDER BY l.created_at DESC LIMIT $2 OFFSET $3",
-    )
-    .bind(&like)
-    .bind(size)
-    .bind(offset)
-    .fetch_all(pool)
-    .await
-    .unwrap_or_default()
+         WHERE {where_sql} ORDER BY l.created_at DESC LIMIT $LIM OFFSET $OFF"
+    );
+    // 参数序号动态确定：version 绑定时占用 $2，LIMIT/OFFSET 顺延
+    let (lim_ph, off_ph) = if version.is_some() { ("$3", "$4") } else { ("$2", "$3") };
+    let select_sql = select_sql.replace("$LIM", lim_ph).replace("$OFF", off_ph);
+    let rows: Vec<LapRow> = if let Some(v) = version {
+        sqlx::query_as(&select_sql)
+            .bind(&like).bind(v).bind(size).bind(offset)
+            .fetch_all(pool).await.unwrap_or_default()
+    } else {
+        sqlx::query_as(&select_sql)
+            .bind(&like).bind(size).bind(offset)
+            .fetch_all(pool).await.unwrap_or_default()
+    }
     .into_iter()
     .map(
         |(id, name, gp, ver, ms, created): (Uuid, String, i16, i32, i32, chrono::DateTime<Utc>)| {
@@ -419,6 +463,11 @@ async fn laps_page(
         return Redirect::to("/admin").into_response();
     }
     let like = format!("%{}%", pq.q);
+    // 圈速类型筛选规范化：非法值一律回落"全部"
+    let best = match pq.best.as_deref() {
+        Some("personal") | Some("server") => pq.best.clone().unwrap_or_default(),
+        _ => String::new(),
+    };
     let total: i64 = sqlx::query_scalar(
         "SELECT count(*) FROM laps l JOIN users u ON u.id=l.user_id WHERE u.username LIKE $1",
     )
@@ -437,16 +486,34 @@ async fn laps_page(
             .fetch_all(&state.pool)
             .await
             .unwrap_or_default();
+    // 版本筛选数据源：库中实际出现过的版本号（升序），模板渲染为下拉
+    let versions: Vec<i64> = sqlx::query_scalar(
+        "SELECT DISTINCT version_code FROM laps ORDER BY version_code",
+    )
+    .fetch_all(&state.pool)
+    .await
+    .unwrap_or_default();
     let tracks_json =
         serde_json::to_string(&tracks).unwrap_or_else(|_| "[]".into());
     let usernames_json =
         serde_json::to_string(&usernames).unwrap_or_else(|_| "[]".into());
     let q_json = serde_json::to_string(&pq.q).unwrap_or_else(|_| "\"\"".into());
-    let (rows, _) = fetch_laps(&state.pool, &pq.q, pq.size, (pq.page - 1) * pq.size).await;
+    let (rows, _) = fetch_laps(
+        &state.pool,
+        &pq.q,
+        pq.version,
+        if best.is_empty() { None } else { Some(best.as_str()) },
+        pq.size,
+        (pq.page - 1) * pq.size,
+    )
+    .await;
     let body = LapsTemplate {
         rows,
         q: pq.q.clone(),
         q_json,
+        version: pq.version.unwrap_or(0) as i64,
+        best,
+        versions,
         page: pq.page,
         size: pq.size,
         pages: ((total + pq.size - 1) / pq.size).max(1),
@@ -600,7 +667,7 @@ async fn logs_page(
     .fetch_one(&state.pool)
     .await
     .unwrap_or(0);
-    let mut pq = PageQuery { q: lq.q.clone(), page: lq.page, size: lq.size };
+    let mut pq = PageQuery { q: lq.q.clone(), version: None, best: None, page: lq.page, size: lq.size };
     clamp_page(&mut pq, total);
     let (rows, _) = fetch_logs(
         &state.pool, &lq.q, &lq.level, &lq.cat, pq.size, (pq.page - 1) * pq.size,
@@ -852,7 +919,7 @@ struct ApiEditLap {
     ms: i32,
 }
 
-/// 编辑圈时（改 lap_ms）→ 同事务重算 best_laps/records。
+/// 编辑圈速（改 lap_ms）→ 同事务重算 best_laps/records。
 async fn api_edit_lap(
     State(state): State<App>,
     headers: HeaderMap,
@@ -869,9 +936,9 @@ async fn api_edit_lap(
     match recalc_edit(&state.pool, lap_id, new_ms, &admin).await {
         Ok(Some((gp, ver))) => {
             crate::qq_bot::broadcast_lap_change(&state, gp, ver, new_ms).await;
-            api_res(true, format!("圈时已改为 {} 并重算", crate::api::leaderboard::format_lap_ms(new_ms)))
+            api_res(true, format!("圈速已改为 {} 并重算", crate::api::leaderboard::format_lap_ms(new_ms)))
         }
-        Ok(None) => api_res(false, "目标不存在或圈时超出合法范围（0 < 圈时 ≤ 60:00.000）"),
+        Ok(None) => api_res(false, "目标不存在或圈速超出合法范围（0 < 圈速 ≤ 60:00.000）"),
         Err(_) => api_res(false, "编辑失败"),
     }
 }
@@ -925,7 +992,7 @@ async fn api_add_lap(
     }
     let lap_ms = f.min * 60_000 + f.sec * 1000 + f.ms;
     if lap_ms <= 0 {
-        return api_res(false, "圈时必须大于 0");
+        return api_res(false, "圈速必须大于 0");
     }
     let user_id: Option<Uuid> = sqlx::query_scalar("SELECT id FROM users WHERE username=$1")
         .bind(username)
@@ -1011,7 +1078,7 @@ async fn recalc_delete(pool: &PgPool, lap_id: Uuid, admin: &str) -> anyhow::Resu
     Ok(Some((gp, ver, before_alltime, before_version)))
 }
 
-/// 编辑圈时（改 lap_ms）后重算同维度。返回 Some((gp, version)) 表示目标存在且已改。
+/// 编辑圈速（改 lap_ms）后重算同维度。返回 Some((gp, version)) 表示目标存在且已改。
 async fn recalc_edit(pool: &PgPool, lap_id: Uuid, new_ms: i32, admin: &str) -> anyhow::Result<Option<(i16, i32)>> {
     let mut tx = pool.begin().await?;
     let target: Option<(Uuid, i16, i32)> =
@@ -1038,7 +1105,7 @@ async fn recalc_edit(pool: &PgPool, lap_id: Uuid, new_ms: i32, admin: &str) -> a
         .ok();
     crate::applog::log_event_tx(
         &mut tx, "info", "admin", "edit_lap", admin,
-        format!("修改成绩圈时 → {}（赛道 {gp} · 版本 {ver}，纪录已重算）", crate::api::leaderboard::format_lap_ms(new_ms)),
+        format!("修改成绩圈速 → {}（赛道 {gp} · 版本 {ver}，纪录已重算）", crate::api::leaderboard::format_lap_ms(new_ms)),
         json!({"lap_id": lap_id.to_string(), "new_ms": new_ms}),
     )
     .await;

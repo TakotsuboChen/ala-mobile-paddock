@@ -43,10 +43,11 @@ pub struct RuleCond {
 
 /// 一条消息规则。kind = "reply"（被动回复）/ "broadcast"（主动播报）。
 /// action（reply 用）= "reply" 普通回复 / "reg_code" 注册校验（建号动作）/
-/// "reset_password" 密码重置（发码动作）。内置动作从触发词（keyword）后提取
-/// 校验码/用户名；成功走 template，失败按类型走独立文案字段（空=内置默认）。
-/// match_all = true 时条件 AND，false 时 OR；conditions 为空 = 恒命中。
-/// 旧格式 keyword 迁移：读入时合成 conditions（与字段 keyword 兼容）。
+/// "reset_password" 密码重置（发码动作）。reg_code 从触发词后提取 #校验码
+/// （提不出码静默，防关键词误触发）；reset_password 严格等于触发词才响应，
+/// 按发言者 member_openid 反查账号（不提取用户名）。成功走 template，
+/// 失败按类型走独立文案字段（空=内置默认）。match_all = true 时条件 AND，
+/// false 时 OR；conditions 为空 = 恒命中。旧格式 keyword 迁移：读入时合成 conditions。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BotRule {
     pub id: String,
@@ -66,9 +67,6 @@ pub struct BotRule {
     #[serde(default)]
     pub fail_template: String,
     // ---- reg_code 专用失败文案（每类失败独立模板；空 = 内置默认） ----
-    /// 锚点后提不出 #码
-    #[serde(default)]
-    pub no_code_template: String,
     /// 码无效/过期（含并发被用掉）
     #[serde(default)]
     pub invalid_code_template: String,
@@ -107,7 +105,6 @@ fn preset_rules() -> Vec<BotRule> {
             match_all: true,
             template: "校验成功，欢迎 {{paddock_name}} 加入，您是全服第 {{paddock_id}} 位车手！请返回模块直接点击登录。".into(),
             fail_template: String::new(),
-            no_code_template: "未识别到校验码：请在「申请围场通行证」后跟 #校验码（模块端申请页可复制完整指令）".into(),
             invalid_code_template: "校验码 {{code}} 无效或已过期，请在围场页重新申请".into(),
             dup_openid_template: "该 QQ 身份已有其他注册校验在途，请勿重复申请".into(),
             no_identity_template: "无法识别你的群身份，请确认已在 QQ 群设置中允许机器人获取群信息".into(),
@@ -117,17 +114,16 @@ fn preset_rules() -> Vec<BotRule> {
         BotRule {
             id: "preset-reset".into(),
             kind: "reply".into(),
-            keyword: "重置密码".into(),
+            keyword: "我需要重置密码".into(),
             action: "reset_password".into(),
             conditions: vec![],
             match_all: true,
             template: "重置码已生成：{{code}}（30 分钟内有效，请勿泄露）。请在围场页用「忘记密码」提交新密码".into(),
             fail_template: String::new(),
-            no_code_template: String::new(),
             invalid_code_template: String::new(),
             dup_openid_template: String::new(),
             no_identity_template: String::new(),
-            no_user_template: "用户名不存在，请核对后重试".into(),
+            no_user_template: "未找到与你的群身份绑定的围场账号。请确认你已注册（群内校验成功），且在本群发送指令（注册时在哪个群校验，就在哪个群申请重置）".into(),
             enabled: true,
         },
         BotRule {
@@ -141,9 +137,8 @@ fn preset_rules() -> Vec<BotRule> {
                 value: "record_alltime".into(),
             }],
             match_all: true,
-            template: "{{paddock_id}} 号车手「{{paddock_name}}」刚刚在{{track}}跑出{{lap}}，刷新了全服历史最快圈速！".into(),
+            template: "{{paddock_id}} 号车手「{{paddock_name}}」刚刚在{{track}}跑出 {{lap}}，刷新了全服历史最快圈速！".into(),
             fail_template: String::new(),
-            no_code_template: String::new(),
             invalid_code_template: String::new(),
             dup_openid_template: String::new(),
             no_identity_template: String::new(),
@@ -161,9 +156,8 @@ fn preset_rules() -> Vec<BotRule> {
                 value: "record_version".into(),
             }],
             match_all: true,
-            template: "{{paddock_id}} 号车手「{{paddock_name}}」刚刚在{{track}}跑出{{lap}}，刷新了{{version}}版本的全服最快圈速！".into(),
+            template: "{{paddock_id}} 号车手「{{paddock_name}}」刚刚在{{track}}跑出 {{lap}}，刷新了 {{version}} 版本的全服最快圈速！".into(),
             fail_template: String::new(),
-            no_code_template: String::new(),
             invalid_code_template: String::new(),
             dup_openid_template: String::new(),
             no_identity_template: String::new(),
@@ -186,6 +180,21 @@ pub async fn load_rules(pool: &PgPool) -> Vec<BotRule> {
         rules = preset_rules();
     }
     for r in &mut rules {
+        // 一次性语义迁移（2026-09-04）：旧 reset_password 规则的触发词是"重置密码"+
+        // 按用户名提取，新语义是"我需要重置密码"严格匹配+按群身份反查。只升级
+        // keyword 仍为旧默认值的规则（用户自定义词视为有意保留，不动）。
+        if r.action == "reset_password" && r.keyword.trim() == "重置密码" {
+            r.keyword = "我需要重置密码".into();
+        }
+        // 一次性文案迁移（2026-09-04 二轮）：播报模板变量两侧空格（跑出 {{lap}} /
+        // {{version}} 版本）。只升级仍与旧默认逐字相等的模板，用户改过的模板不动。
+        if r.kind == "broadcast" {
+            if r.template == "{{paddock_id}} 号车手「{{paddock_name}}」刚刚在{{track}}跑出{{lap}}，刷新了全服历史最快圈速！" {
+                r.template = preset_rules()[2].template.clone();
+            } else if r.template == "{{paddock_id}} 号车手「{{paddock_name}}」刚刚在{{track}}跑出{{lap}}，刷新了{{version}}版本的全服最快圈速！" {
+                r.template = preset_rules()[3].template.clone();
+            }
+        }
         // 旧 keyword 格式迁移：普通回复/播报合成 conditions；
         // 动作规则（reg_code/reset_password）触发词即条件，不生成条件行
         if r.conditions.is_empty()
@@ -226,10 +235,21 @@ fn cond_matches(cond: &RuleCond, content: &str, event: &str) -> bool {
 }
 
 fn rule_matches(rule: &BotRule, content: &str, event: &str) -> bool {
-    // 动作规则（reg_code/reset_password）：触发词即条件（词出现在消息中即命中）
+    // 动作规则：
+    // - reg_code：触发词出现在消息中即进入处理（是否响应由码提取结果决定——
+    //   提不出 #码 静默，防"申请围场通行证"裸关键词被闲聊误触发）
+    // - reset_password：消息内容严格等于触发词才响应（防包含关键词的闲聊误触发；
+    //   不提取用户名，账号按发言者 member_openid 反查）
     if rule.kind == "reply" && (rule.action == "reg_code" || rule.action == "reset_password") {
         let kw = rule.keyword.trim();
-        return !kw.is_empty() && content.contains(kw);
+        if kw.is_empty() {
+            return false;
+        }
+        return if rule.action == "reset_password" {
+            content.trim() == kw
+        } else {
+            content.contains(kw)
+        };
     }
     // 其他规则：conditions 为空 = 恒命中（播报可配恒播）
     if rule.conditions.is_empty() {
@@ -798,7 +818,7 @@ async fn handle_group_message(state: &App, event_id: &str, d: &Value) {
                 return; // 一条消息只命中一条动作规则
             }
             "reset_password" => {
-                handle_reset_password(state, r, &msg_id, &ref_id, &normalized, &qq_name, &msg.group_openid).await;
+                handle_reset_password(state, r, &msg_id, &ref_id, &qq_name, msg.member_openid(), &msg.group_openid).await;
                 return;
             }
             _ => {
@@ -826,15 +846,13 @@ async fn handle_group_message(state: &App, event_id: &str, d: &Value) {
 }
 
 /// 各失败类型的内置默认文案（面板预设预填的源头；用户改模板后以模板为准）。
-/// 模板变量 {{code}}（校验码）/{{name}}（用户名）——动态部分经变量注入，
-/// {{reason}} 废除：文案必须完全可编辑，不允许留一个"展开后才可见"的占位符。
+/// 模板变量 {{code}}（校验码）/ {{name}}（用户名）——动态部分经变量注入。
 fn builtin_reason(t: FailType, code: &str) -> String {
     match t {
-        FailType::NoCode => "未识别到校验码：请在「申请围场通行证」后跟 #校验码".to_string(),
         FailType::InvalidCode => format!("校验码 {code} 无效或已过期，请在围场页重新申请"),
         FailType::DupOpenid => "该 QQ 身份已有其他注册校验在途，请勿重复申请".to_string(),
         FailType::NoIdentity => "无法识别你的群身份，请确认已在 QQ 群设置中允许机器人获取群信息".to_string(),
-        FailType::NoUser => "用户名不存在，请核对后重试".to_string(),
+        FailType::NoUser => "未找到与你的群身份绑定的围场账号（注册时在哪个群校验，就在哪个群申请重置）".to_string(),
     }
 }
 
@@ -842,7 +860,6 @@ fn builtin_reason(t: FailType, code: &str) -> String {
 /// 模板内可用 {{code}}/{{name}}；无任何隐藏占位符。
 fn fail_type_reply(rule: &BotRule, t: FailType, code: &str, username: &str) -> String {
     let specific = match t {
-        FailType::NoCode => &rule.no_code_template,
         FailType::InvalidCode => &rule.invalid_code_template,
         FailType::DupOpenid => &rule.dup_openid_template,
         FailType::NoIdentity => &rule.no_identity_template,
@@ -861,7 +878,8 @@ fn fail_type_reply(rule: &BotRule, t: FailType, code: &str, username: &str) -> S
 }
 
 /// 注册校验（action=reg_code）：从触发词后提取校验码 → pending_regs 定位会话 →
-/// 直接建号 → 按规则模板引用回复。成功走 template，失败走 fail_template（空=内置文案）。
+/// 直接建号 → 按规则模板引用回复。成功走 template，失败走独立失败文案。
+/// 提不出 #码 → 静默返回（不回复）：裸关键词/闲聊含关键词不响应（2026-09-04 定案）。
 /// 约束（PADDOCK_PLAN §6 S4）：一条码一openid；重复绑定他人码会被唯一约束拦。
 async fn handle_reg_code(
     state: &App,
@@ -884,12 +902,14 @@ async fn handle_reg_code(
                 .unwrap_or_default()
         })
         .unwrap_or_default();
+    if code.is_empty() {
+        // 锚点后没有 #xxx：静默——不响应裸关键词（防误触发），不消耗 msg_id 回复窗
+        tracing::info!("[qq_bot] reg_code 关键词命中但提不出校验码，静默: {content}");
+        return;
+    }
 
     let reply = if member_openid.is_empty() {
         fail_type_reply(rule, FailType::NoIdentity, "", "")
-    } else if code.is_empty() {
-        // 提不出码（锚点后没有 #xxx）：独立出口（v17 新增，此前带空码落到"码无效"）
-        fail_type_reply(rule, FailType::NoCode, "", "")
     } else {
         let n: Result<i64, _> = sqlx::query_scalar(
             "SELECT count(*) FROM pending_regs WHERE reg_code = $1 AND expires_at > now()",
@@ -960,45 +980,55 @@ async fn handle_reg_code(
 /// 失败类型：对应 BotRule 的每类独立模板字段。
 #[derive(Clone, Copy)]
 enum FailType {
-    NoCode,
     InvalidCode,
     DupOpenid,
     NoIdentity,
     NoUser,
 }
 
-/// 密码重置（action=reset_password）：触发词后提取用户名 → 一次性码（30 分钟）→
-/// 按规则模板引用回复。
+/// 密码重置（action=reset_password）：消息严格等于触发词才进入本函数。
+/// 不提取用户名——账号按发言者 member_openid 反查（注册校验绑定时的群身份）。
+/// 注意 member_openid 按群隔离：换群发指令匹配不到（失败文案已说明）。
 async fn handle_reset_password(
     state: &App,
     rule: &BotRule,
     msg_id: &str,
     ref_id: &str,
-    content: &str,
     qq_name: &str,
+    member_openid: &str,
     group: &str,
 ) {
-    let anchor = if rule.keyword.is_empty() { "重置密码" } else { rule.keyword.as_str() };
-    let name = content
-        .find(anchor)
-        .map(|idx| content[idx + anchor.len()..].trim().to_string())
-        .unwrap_or_default();
-    let reply = match auth_handlers::create_reset_code(&state.pool, &name).await {
-        Ok(code) => {
-            crate::applog::log_event(
-                &state.pool, "info", "auth", "reset_code_issued", &name,
-                format!("签发密码重置码（群内申请，30 分钟有效）"),
-                json!({}),
-            );
-            let vars = ReplyVars {
-                qq_name: qq_name.to_string(),
-                paddock_name: name.clone(),
-                paddock_id: String::new(),
-                code,
-            };
-            render_reply_template(&rule.template, &vars)
+    let reply = if member_openid.is_empty() {
+        fail_type_reply(rule, FailType::NoIdentity, "", "")
+    } else {
+        let (username, reg_seq): (String, i64) = sqlx::query_as(
+            "SELECT username, reg_seq FROM users WHERE member_openid = $1",
+        )
+        .bind(member_openid)
+        .fetch_one(&state.pool)
+        .await
+        .unwrap_or((String::new(), 0));
+        if username.is_empty() {
+            fail_type_reply(rule, FailType::NoUser, "", "")
+        } else {
+            match auth_handlers::create_reset_code(&state.pool, &username).await {
+                Ok(code) => {
+                    crate::applog::log_event(
+                        &state.pool, "info", "auth", "reset_code_issued", &username,
+                        format!("签发密码重置码（群内申请，30 分钟有效）"),
+                        json!({}),
+                    );
+                    let vars = ReplyVars {
+                        qq_name: qq_name.to_string(),
+                        paddock_name: username,
+                        paddock_id: reg_seq.to_string(),
+                        code,
+                    };
+                    render_reply_template(&rule.template, &vars)
+                }
+                Err(_) => fail_type_reply(rule, FailType::NoUser, "", &username),
+            }
         }
-        Err(e) => fail_type_reply(rule, FailType::NoUser, "", &name),
     };
     send_group_reply(state, group.to_string(), msg_id, ref_id, reply).await;
 }
@@ -1060,29 +1090,13 @@ async fn handle_c2c_message(state: &App, event_id: &str, d: &Value) {
         }
         match r.action.as_str() {
             "reg_code" => {
-                let anchor = if r.keyword.is_empty() { "申请围场通行证" } else { r.keyword.as_str() };
-                let _ = anchor;
-                // 单聊无群身份，建号不可行：按该规则的 NoIdentity 文案引导回群
+                // 单聊无群身份（member_openid），建号不可行：按该规则的 NoIdentity 文案引导回群
                 reply = Some(fail_type_reply(r, FailType::NoIdentity, "", ""));
             }
             "reset_password" => {
-                let anchor = if r.keyword.is_empty() { "重置密码" } else { r.keyword.as_str() };
-                let name = normalized
-                    .find(anchor)
-                    .map(|idx| normalized[idx + anchor.len()..].trim().to_string())
-                    .unwrap_or_default();
-                reply = Some(match auth_handlers::create_reset_code(&state.pool, &name).await {
-                    Ok(code) => {
-                        let vars = ReplyVars {
-                            qq_name: String::new(),
-                            paddock_name: name.clone(),
-                            paddock_id: String::new(),
-                            code,
-                        };
-                        render_reply_template(&r.template, &vars)
-                    }
-                    Err(_) => fail_type_reply(r, FailType::NoUser, "", &name),
-                });
+                // 单聊 user_openid 与群 member_openid 两体系不互通，无法按群身份反查账号：
+                // 一律引导回群（严格匹配触发词由 rule_matches 已保证）
+                reply = Some(fail_type_reply(r, FailType::NoIdentity, "", ""));
             }
             _ => {
                 // 普通回复：单聊无 member_openid（是 user_openid，两体系不互通），围场变量空

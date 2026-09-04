@@ -32,7 +32,7 @@
 
 <h3 style="color:#8af;margin-top:2rem">消息配置</h3>
 <p style="color:#777;font-size:.85rem;max-width:640px">
-  被动回复：群消息满足条件时 bot 以<b>引用该消息</b>的形式回复模板。主动播报：满足条件的事件发生时 bot 向勾选的群推送消息（未认证应用主动消息额度极低，可能被平台限流）。多个条件可用「满足全部 / 满足任一」组合；内置动作（注册校验/密码重置）的触发词是提取锚点，码/用户名取其后的内容。
+  被动回复：群消息满足条件时 bot 以<b>引用该消息</b>的形式回复模板。主动播报：满足条件的事件发生时 bot 向勾选的群推送消息（未认证应用主动消息额度极低，可能被平台限流）。多个条件可用「满足全部 / 满足任一」组合；内置动作的触发语义：注册校验=消息含触发词且其后有 #校验码（提不出码静默不响应）；密码重置=消息严格等于触发词，账号按发言者群身份自动匹配。
 </p>
 <div style="display:flex;gap:.5rem;margin:.6rem 0;flex-wrap:wrap" id="var-chips"></div>
 <button class="btn primary" onclick="ruleAdd()">新增规则</button>
@@ -98,13 +98,12 @@ function isActionRule(r){ return r.kind==='reply' && (r.action==='reg_code'||r.a
 // 动作规则的每类失败字段（label + BotRule 字段名）
 const FAIL_FIELDS = {
   reg_code: [
-    ['no_code_template','提不出校验码（触发词后没有 #码）'],
     ['invalid_code_template','校验码无效/过期'],
     ['dup_openid_template','该 QQ 已有在途会话/已绑定'],
     ['no_identity_template','无法识别群身份'],
   ],
   reset_password: [
-    ['no_user_template','用户名不存在'],
+    ['no_user_template','未找到发言者绑定的围场账号'],
   ],
 };
 function renderRules(){
@@ -238,7 +237,7 @@ const PRESET_FAIL = {
     dup_openid_template: '该 QQ 身份已有其他注册校验在途，请勿重复申请',
     no_identity_template: '无法识别你的群身份，请确认已在 QQ 群设置中允许机器人获取群信息',
   },
-  reset_password: { no_user_template: '用户名不存在，请核对后重试' },
+  reset_password: { no_user_template: '未找到与你的群身份绑定的围场账号。请确认你已注册，且在本群发送指令（注册时在哪个群校验，就在哪个群申请重置）' },
 };
 function ruleModal(r){
   window._editingRule = JSON.parse(JSON.stringify(r));
@@ -260,7 +259,7 @@ function ruleModal(r){
         </select>
       </div>
       <div id="m-kw-wrap">
-        <label>触发词（即触发条件；校验码/用户名取词后内容，注册码需带 #）</label>
+        <label>触发词（注册校验：消息含该词且其后带 #校验码才响应；密码重置：消息严格等于该词才响应，账号按发言者群身份自动匹配）</label>
         <input id="m-keyword" value="${(window._editingRule.keyword||'').replaceAll('"','&quot;')}">
       </div>
       <div id="m-cond-wrap">

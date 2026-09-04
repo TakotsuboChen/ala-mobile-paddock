@@ -1,8 +1,10 @@
 //! 认证端点：注册申请 / 登录 / 一次性码重置。
 //! 注册闭环（2026-09-01 定案 v2：bot 校验即建号）：模块申请（username+password，服务端
-//! 哈希密码+发车手 ID 存 pending 会话）→ 用户在 CAMDA 群发"申请围场通行证#XXXXXXXX"
+//! 哈希密码存 pending 会话）→ 用户在 CAMDA 群发"申请围场通行证#XXXXXXXX"
 //! → bot 用码定位会话绑定 member_openid **并直接建号**（回复车手 ID）→ 用户回模块
 //! 用同一账号密码直接登录。旧 register-verify 端点已删（bot 建号后无 verify 步骤）。
+//! 2026-09-04 v3：车手 ID 改为建号时才发放（申请时发号会因 pending 作废烧号）；
+//! register-request 对同名在途会话幂等恢复（密码一致返回原码，支持重弹申请指令）。
 
 use axum::{
     Json, Router,
@@ -39,40 +41,49 @@ pub async fn register_request(
     if user_exists(&state.pool, &req.username).await? {
         return Err(ApiError::conflict("用户名已存在（不允许重复注册）"));
     }
-    // 同名在途会话检查：pending 里锁存了 username，防止同名并发注册
-    let pending_same_name: i64 = sqlx::query_scalar(
-        "SELECT count(*) FROM pending_regs WHERE username = $1 AND expires_at > now()",
+    // 幂等恢复（2026-09-04）：同名在途会话且请求密码与锁存哈希一致 → 返回原校验码。
+    // 场景：用户拿到申请指令后没复制/弹窗被关，回模块重新点"注册"应重新弹出，
+    // 而不是被"已有申请在途"挡死。密码不一致 → 409 拒绝（防用户名抢占攻击：
+    // 若放行覆盖，攻击者可改受害者 pending 密码，再用自己群里发的码抢建该用户名）。
+    let existing: Option<(String, String)> = sqlx::query_as(
+        "SELECT reg_code, pass_hash FROM pending_regs WHERE username = $1 AND expires_at > now()",
     )
     .bind(&req.username)
-    .fetch_one(&state.pool)
+    .fetch_optional(&state.pool)
     .await?;
-    if pending_same_name > 0 {
+    if let Some((reg_code, pass_hash)) = existing {
+        if auth::verify_password(&req.password, &pass_hash) {
+            crate::applog::log_event(
+                &state.pool, "info", "auth", "register_request", &req.username,
+                format!("在途会话幂等恢复（重弹申请指令，校验码 {reg_code}）"),
+                serde_json::json!({}),
+            );
+            return Ok(Json(RegisterRequestResp {
+                message_hint: format!("申请围场通行证#{reg_code}"),
+                reg_code,
+            }));
+        }
         return Err(ApiError::conflict(
-            "该用户名已有注册申请在途，请等待其完成或过期后再试",
+            "该用户名已有注册申请在途，且密码不一致；若是你本人的申请，请用原密码重试，否则请等待其过期（30 分钟）",
         ));
     }
     let reg_code = auth::gen_reg_code();
     let pass_hash = auth::hash_password(&req.password)?;
-    // 车手 ID 申请时即发放（bot 回复需要序号）；未完成注册的号作废（顺序不乱，允许空缺）
-    let reg_seq: i64 = sqlx::query_scalar::<_, i64>("SELECT nextval('user_reg_seq')")
-        .fetch_one(&state.pool)
-        .await?;
     let expires = Utc::now() + Duration::minutes(auth::REG_CODE_TTL_MINUTES);
     sqlx::query(
-        "INSERT INTO pending_regs (reg_code, username, pass_hash, reg_seq, expires_at) \
-         VALUES ($1, $2, $3, $4, $5)",
+        "INSERT INTO pending_regs (reg_code, username, pass_hash, expires_at) \
+         VALUES ($1, $2, $3, $4)",
     )
     .bind(&reg_code)
     .bind(&req.username)
     .bind(&pass_hash)
-    .bind(reg_seq)
     .bind(expires)
     .execute(&state.pool)
     .await?;
     crate::applog::log_event(
         &state.pool, "info", "auth", "register_request", &req.username,
-        format!("申请注册（校验码 {reg_code}，车手 ID {reg_seq}）"),
-        serde_json::json!({"reg_seq": reg_seq}),
+        format!("申请注册（校验码 {reg_code}）"),
+        serde_json::json!({}),
     );
     Ok(Json(RegisterRequestResp {
         message_hint: format!("申请围场通行证#{reg_code}"),
@@ -80,8 +91,10 @@ pub async fn register_request(
     }))
 }
 
-/// 建号事务（bot 校验成功即调）：pending 会话已被绑上 member_openid，
-/// DELETE ... RETURNING 拿到锁存的用户名/密码哈希/车手 ID → INSERT users → 提交。
+/// 车手 ID 建号时才发放，取**最小未被使用的正整数**（2026-09-04 v4，用户定案）：
+/// 反复注册-放弃的用户不会被越推越后，弃号立即回收。并发注册可能同时选中同一号
+/// ——reg_seq 唯一约束会让后者建号失败重试，竞态窗口极小，可接受。
+/// 注意 PG 查询非事务性锁——高并发下靠唯一约束兜底，不额外加锁。
 /// 公开给 qq_bot 调用；建号失败（openid 已绑号等）由调用方回滚并回复错误文案。
 pub async fn create_user_from_pending(
     pool: &PgPool,
@@ -89,15 +102,15 @@ pub async fn create_user_from_pending(
     member_openid: &str,
 ) -> Result<Uuid, (StatusCode, String)> {
     let mut tx = pool.begin().await.map_err(internal)?;
-    let row: Option<(String, String, i64)> = sqlx::query_as(
+    let row: Option<(String, String)> = sqlx::query_as(
         "DELETE FROM pending_regs WHERE reg_code = $1 AND expires_at > now() \
-         RETURNING username, pass_hash, reg_seq",
+         RETURNING username, pass_hash",
     )
     .bind(reg_code)
     .fetch_optional(&mut *tx)
     .await
     .map_err(internal)?;
-    let Some((username, pass_hash, reg_seq)) = row else {
+    let Some((username, pass_hash)) = row else {
         return Err((StatusCode::NOT_FOUND, "校验码无效或已过期，请重新申请".into()));
     };
     if sqlx::query_scalar::<_, i64>("SELECT count(*) FROM users WHERE member_openid = $1")
@@ -112,6 +125,15 @@ pub async fn create_user_from_pending(
             "该 QQ 身份已绑定过账号，不允许重复注册".into(),
         ));
     }
+    // 最小空缺号：1..=max+1 中第一个未被占用的值（无用户时 = 1）
+    let reg_seq: i64 = sqlx::query_scalar(
+        "SELECT COALESCE(MIN(s.seq), 1) \
+         FROM generate_series(1, (SELECT COALESCE(MAX(reg_seq), 0) + 1 FROM users)) AS s(seq) \
+         WHERE s.seq NOT IN (SELECT reg_seq FROM users)",
+    )
+    .fetch_one(&mut *tx)
+    .await
+    .map_err(internal)?;
     let user_id = Uuid::now_v7();
     sqlx::query(
         "INSERT INTO users (id, username, pass_hash, member_openid, reg_seq) VALUES ($1,$2,$3,$4,$5)",

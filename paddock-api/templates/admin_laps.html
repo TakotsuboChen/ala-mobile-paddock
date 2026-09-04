@@ -1,12 +1,21 @@
 <h2>成绩管理</h2>
-<form method="get" action="/admin/laps" style="margin-bottom:.8rem;display:flex;gap:.6rem;align-items:center">
-  <input name="q" value="{{ q }}" placeholder="按用户名筛选" style="padding:.4rem;border-radius:6px;border:1px solid #444;background:#2a2a2c;color:#eee">
+<form method="get" action="/admin/laps" style="margin-bottom:.8rem;display:flex;gap:.6rem;align-items:center;flex-wrap:wrap">
+  <input name="q" value="{{ q }}" placeholder="用户名" style="padding:.4rem;border-radius:6px;border:1px solid #444;background:#2a2a2c;color:#eee">
+  <select name="version" style="padding:.4rem;border-radius:6px;border:1px solid #444;background:#2a2a2c;color:#eee">
+    <option value="">版本（全部）</option>
+    {% for v in versions %}<option value="{{ v }}" {% if version == *v %}selected{% endif %}>{{ v }}</option>{% endfor %}
+  </select>
+  <select name="best" style="padding:.4rem;border-radius:6px;border:1px solid #444;background:#2a2a2c;color:#eee">
+    <option value="">圈速（全部）</option>
+    <option value="personal" {% if best == "personal" %}selected{% endif %}>个人最快</option>
+    <option value="server" {% if best == "server" %}selected{% endif %}>全服最快</option>
+  </select>
   <button class="btn">筛选</button>
   <span style="flex:1"></span>
   <button type="button" class="btn primary" onclick="lapAdd()">添加成绩</button>
 </form>
 <table id="lap-table">
-<tr><th>时间</th><th>用户</th><th>赛道</th><th>版本</th><th>圈时</th><th>操作</th></tr>
+<tr><th>时间</th><th>用户</th><th>赛道</th><th>版本</th><th>圈速</th><th>操作</th></tr>
 {% for l in rows %}
 <tr data-id="{{ l.id }}" data-ms="{{ l.lap_ms_raw }}" data-user="{{ l.username }}">
   <td class="code">{{ l.created }}</td>
@@ -28,8 +37,15 @@ const TRACKS = {{ tracks_json | safe }};
 const USERS = {{ usernames_json | safe }};
 const P = { page: {{ page }}, pages: {{ pages }}, size: {{ size }}, q: {{ q_json | safe }} };
 function goPage(p, s){
-  const q = P.q ? `&q=${encodeURIComponent(P.q)}` : '';
-  location.href = `/admin/laps?page=${p}&size=${s}${q}`;
+  const f = document.querySelector('form[action="/admin/laps"]');
+  const qs = new URLSearchParams();
+  const qv = f?.querySelector('input[name=q]')?.value.trim() || '';
+  const vv = f?.querySelector('select[name=version]')?.value || '';
+  const bv = f?.querySelector('select[name=best]')?.value || '';
+  if (qv) qs.set('q', qv);
+  if (vv) qs.set('version', vv);
+  if (bv) qs.set('best', bv);
+  location.href = `/admin/laps?page=${p}&size=${s}&${qs.toString()}`;
 }
 renderPager(document.getElementById('lap-pager'), P.page, P.pages, P.size,
   (p,s)=>goPage(p,s), s=>goPage(1,s));
@@ -45,14 +61,14 @@ function readLap(mask){
   const min = parseInt(mask.querySelector('#m-min').value)||0;
   const sec = parseInt(mask.querySelector('#m-sec').value)||0;
   const ms  = parseInt(mask.querySelector('#m-ms').value)||0;
-  if(min===0 && sec===0 && ms===0) throw new Error('圈时必须大于 0');
+  if(min===0 && sec===0 && ms===0) throw new Error('圈速必须大于 0');
   return {min, sec, ms};
 }
 function lapEdit(tr){
   const id = tr.dataset.id, ms = parseInt(tr.dataset.ms), user = tr.dataset.user;
   openModal({
     title: `编辑成绩 · ${user}`,
-    body: `<p class="hint">原圈时 ${tr.children[4].textContent}，改后自动重算榜单/纪录。</p>${lapInputs(ms)}`,
+    body: `<p class="hint">原圈速 ${tr.children[4].textContent}，改后自动重算榜单/纪录。</p>${lapInputs(ms)}`,
     okText: '保存',
     onOk: async (mask)=>{
       const msg = await api(`/admin/api/laps/${id}/edit`, readLap(mask));
@@ -81,7 +97,7 @@ function lapAdd(){
     body: `
       <label>用户</label><div id="m-user"></div>
       <label>赛道</label><div id="m-track"></div>
-      <label>圈时</label>${lapInputs()}`,
+      <label>圈速</label>${lapInputs()}`,
     okText: '添加',
     onOk: async (mask)=>{
       const gp = parseInt(trackC.value);
