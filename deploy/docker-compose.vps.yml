@@ -5,7 +5,7 @@
 
 services:
   app:
-    image: paddock-api:1.0.0
+    image: paddock-api:1.0.1
     restart: unless-stopped
     environment:
       DATABASE_URL: postgres://paddock:${POSTGRES_PASSWORD}@postgres:5432/paddock
