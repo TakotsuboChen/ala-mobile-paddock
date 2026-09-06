@@ -56,11 +56,11 @@ function goPage(p, s){
 renderPager(document.getElementById('lap-pager'), P.page, P.pages, P.size,
   (p,s)=>goPage(p,s), s=>goPage(1,s));
 function lapInputs(ms){
-  const [m, s, f] = ms!==undefined ? splitMs(ms) : [0,0,0];
+  const [m, s, f] = ms!==undefined ? splitMs(ms) : ['','',''];
   return `<div class="lap-inputs">
-    <input id="m-min" type="number" min="0" max="59" value="${m}"><span>分</span>
-    <input id="m-sec" type="number" min="0" max="59" value="${s}"><span>秒</span>
-    <input id="m-ms" type="number" min="0" max="999" value="${f}"><span>毫秒</span>
+    <input id="m-min" type="number" min="0" max="59" value="${m}" placeholder="0"><span>分</span>
+    <input id="m-sec" type="number" min="0" max="59" value="${s}" placeholder="0"><span>秒</span>
+    <input id="m-ms" type="number" min="0" max="999" value="${f}" placeholder="0"><span>毫秒</span>
   </div>`;
 }
 function readLap(mask){
