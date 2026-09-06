@@ -281,22 +281,57 @@ fn rule_matches(rule: &BotRule, content: &str, event: &str) -> bool {
     }
 }
 
+/// 播报用赛道名：去国旗与文字间空格（播报文案紧凑，模块 UI 侧仍保留空格）。
+fn track_display_name_compact(gp_index: i16) -> String {
+    let name = crate::api::laps::track_display_name(gp_index);
+    // 契约格式="国旗 emoji(2 个区域指示符 U+1F1E6..1F1FF) + 空格 + 文字"。
+    // ⚠️ 旗码点必须成对判定【并拼回输出】——只取 rest 会把整面旗丢掉（2026-09-06 二次事故）。
+    let mut chars = name.chars();
+    match (chars.next(), chars.next()) {
+        (Some(a), Some(b))
+            if ('\u{1F1E6}'..='\u{1F1FF}').contains(&a)
+                && ('\u{1F1E6}'..='\u{1F1FF}').contains(&b) =>
+        {
+            let rest = chars.as_str().strip_prefix(' ').unwrap_or(chars.as_str());
+            format!("{a}{b}{rest}")
+        }
+        _ => name.to_string(),
+    }
+}
+
+/// "车手"提及：openid 非空 → 官方 XML 风格标签 <qqbot-at-user id=".." />
+/// （text-chain 规范标准格式；旧式 <@openid> 已弃用、出站被平台转义为裸文本，
+/// markdown/纯文本两通道均实证 2026-09-06）；openid 缺失 → 退化为纯文本 @「用户名」。
+fn at_user(openid: &str, username: &str) -> String {
+    if !openid.is_empty() {
+        format!("<qqbot-at-user id=\"{openid}\" />")
+    } else if !username.is_empty() {
+        format!("@「{username}」")
+    } else {
+        String::new()
+    }
+}
+
 /// 被动回复渲染变量：{{qq_name}}（群昵称）、{{paddock_name}}（围场用户名）、
-/// {{paddock_id}}（车手 ID）、{{code}}（校验码/重置码）。
+/// {{paddock_id}}（车手 ID）、{{code}}（校验码/重置码）、{{at_me}}（@车手文本
+/// 优先 <qqbot-at-user id=".."/>，openid 缺失退化 @「用户名」，见 at_user）。
 pub struct ReplyVars {
     pub qq_name: String,
     pub paddock_name: String,
     pub paddock_id: String,
     pub code: String,
+    pub at_me: String,
 }
 
-/// 主动播报渲染变量：{{track}}、{{lap}}、{{version}}、{{paddock_name}}、{{paddock_id}}。
+/// 主动播报渲染变量：{{track}}、{{lap}}、{{version}}、{{paddock_name}}、{{paddock_id}}、
+/// {{at_me}}（@纪录持有者文本 @「用户名」；查不到=空串）。
 pub struct BroadcastVars {
     pub track: String,
     pub lap: String,
     pub version: String,
     pub paddock_name: String,
     pub paddock_id: String,
+    pub at_me: String,
 }
 
 /// 删除场景专用：仅当删除导致该维度纪录变化（值变或易主）才播报。
@@ -357,20 +392,21 @@ async fn broadcast_current_record(state: &App, gp_index: i16, version_code: i32,
         .flatten()
     };
     let Some((lap_ms, holder)) = row else { return };
-    let (username, reg_seq): (String, i64) = sqlx::query_as(
-        "SELECT username, reg_seq FROM users WHERE id=$1",
+    let (username, reg_seq, holder_openid): (String, i64, String) = sqlx::query_as(
+        "SELECT username, reg_seq, COALESCE(member_openid,'') FROM users WHERE id=$1",
     )
     .bind(holder)
     .fetch_one(&state.pool)
     .await
-    .unwrap_or((String::new(), 0));
+    .unwrap_or((String::new(), 0, String::new()));
     broadcast(
         state,
         event,
         &BroadcastVars {
-            track: crate::api::laps::track_display_name(gp_index).to_string(),
+            track: track_display_name_compact(gp_index),
             lap: crate::api::leaderboard::format_lap_ms(lap_ms),
             version: crate::api::laps::version_display(version_code),
+            at_me: at_user(&holder_openid, &username),
             paddock_name: username,
             paddock_id: reg_seq.to_string(),
         },
@@ -416,21 +452,22 @@ pub async fn broadcast_lap_change(state: &App, gp_index: i16, version_code: i32,
     } else {
         version.as_ref().unwrap().clone()
     };
-    let (username, reg_seq): (String, i64) = sqlx::query_as(
-        "SELECT username, reg_seq FROM users WHERE id=$1",
+    let (username, reg_seq, holder_openid): (String, i64, String) = sqlx::query_as(
+        "SELECT username, reg_seq, COALESCE(member_openid,'') FROM users WHERE id=$1",
     )
     .bind(holder_id)
     .fetch_one(&state.pool)
     .await
-    .unwrap_or((String::new(), 0));
+    .unwrap_or((String::new(), 0, String::new()));
     let event = if alltime_hit { "record_alltime" } else { "record_version" };
     broadcast(
         state,
         event,
         &BroadcastVars {
-            track: crate::api::laps::track_display_name(gp_index).to_string(),
+            track: track_display_name_compact(gp_index),
             lap: crate::api::leaderboard::format_lap_ms(holder_ms),
             version: crate::api::laps::version_display(version_code),
+            at_me: at_user(&holder_openid, &username),
             paddock_name: username,
             paddock_id: reg_seq.to_string(),
         },
@@ -452,6 +489,7 @@ fn render_reply_template(t: &str, vars: &ReplyVars) -> String {
         ("paddock_name", vars.paddock_name.as_str()),
         ("paddock_id", vars.paddock_id.as_str()),
         ("code", vars.code.as_str()),
+        ("at_me", vars.at_me.as_str()),
     ])
 }
 
@@ -473,6 +511,7 @@ pub async fn broadcast(state: &App, event: &str, vars: &BroadcastVars) {
             ("version", vars.version.as_str()),
             ("paddock_name", vars.paddock_name.as_str()),
             ("paddock_id", vars.paddock_id.as_str()),
+            ("at_me", vars.at_me.as_str()),
         ]);
         for g in &groups {
             // 主动消息：不带 msg_id（未认证额度极低，失败只记日志）
@@ -851,6 +890,7 @@ async fn handle_group_message(state: &App, event_id: &str, d: &Value) {
                 .unwrap_or((String::new(), 0));
                 let vars = ReplyVars {
                     qq_name: qq_name.clone(),
+                    at_me: at_user(msg.member_openid(), &name),
                     paddock_name: name,
                     paddock_id: seq.to_string(),
                     code: String::new(),
@@ -894,6 +934,7 @@ fn fail_type_reply(rule: &BotRule, t: FailType, code: &str, username: &str) -> S
     tpl.replace("{{code}}", code)
        .replace("{{name}}", username)
        .replace("{{qq_name}}", "") // 失败场景 qq_name 多数无效，留空避免渲染残留
+       .replace("{{at_me}}", "")   // 同上：失败文案无法定位群身份，@ 标签留空避免残留
 }
 
 /// 注册校验（action=reg_code）：从触发词后提取校验码 → pending_regs 定位会话 →
@@ -976,6 +1017,7 @@ async fn handle_reg_code(
                             );
                             let vars = ReplyVars {
                                 qq_name: qq_name.to_string(),
+                                at_me: at_user(member_openid, &username),
                                 paddock_name: username,
                                 paddock_id: reg_seq.to_string(),
                                 code: code.to_string(),
@@ -1039,6 +1081,7 @@ async fn handle_reset_password(
                     );
                     let vars = ReplyVars {
                         qq_name: qq_name.to_string(),
+                        at_me: at_user(member_openid, &username),
                         paddock_name: username,
                         paddock_id: reg_seq.to_string(),
                         code,
@@ -1124,6 +1167,7 @@ async fn handle_c2c_message(state: &App, event_id: &str, d: &Value) {
                     paddock_name: String::new(),
                     paddock_id: String::new(),
                     code: String::new(),
+                    at_me: String::new(),
                 };
                 reply = Some(render_reply_template(&r.template, &vars));
             }
@@ -1246,11 +1290,24 @@ async fn send_message(pool: &PgPool, job: &SendJob, group: bool) -> anyhow::Resu
         )
     };
     let client = reqwest::Client::new();
-    let mut payload = json!({
-        "msg_type": 0,
-        "content": job.content,
-        "msg_seq": 1,
-    });
+    // 提及标签 <qqbot-at-user id=".."/> 只在 markdown 通道被解析（社区框架实证：
+    // bunqq-core/Gensokyo——msg_type=0 文本通道对 XML 标签原样打印，2026-09-06 四轮
+    // 实测矩阵：旧<@>+md=转义、旧<@>+文本=转义、新标签+文本=原样打印，唯余新标签+md）。
+    // ⚠️ markdown 与 content 字段互斥，含标签即整体走 markdown.content。
+    let has_at_tag = job.content.contains("<qqbot-at-user");
+    let mut payload = if has_at_tag {
+        json!({
+            "msg_type": 2,
+            "markdown": { "content": job.content },
+            "msg_seq": 1,
+        })
+    } else {
+        json!({
+            "msg_type": 0,
+            "content": job.content,
+            "msg_seq": 1,
+        })
+    };
     // 被动回复必带 msg_id；主动消息（broadcast）不带——字段缺失即主动消息语义
     if !job.msg_id.is_empty() {
         payload["msg_id"] = json!(job.msg_id);
@@ -1260,7 +1317,7 @@ async fn send_message(pool: &PgPool, job: &SendJob, group: bool) -> anyhow::Resu
         payload["message_reference"] = json!({ "message_id": job.ref_msg_id });
     }
     let res = client
-        .post(url)
+        .post(&url)
         // 官方鉴权格式固定为 "QQBot {access_token}"（非 Bearer，见 api-use.html）
         .header("Authorization", format!("QQBot {access_token}"))
         .header("X-Union-Appid", &app_id)

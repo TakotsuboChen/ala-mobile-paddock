@@ -63,10 +63,10 @@
 const RULES = {{ rules_json | safe }};
 // 变量芯片：insert 到当前编辑弹窗的 textarea（varTag 运行时拼接占位符，避开服务端模板语法）
 const REPLY_VARS = [
-  ['围场用户名','paddock_name'], ['围场 ID','paddock_id'], ['校验码','code'],
+  ['围场用户名','paddock_name'], ['围场 ID','paddock_id'], ['校验码','code'], ['@车手','at_me'],
 ];
 const BCAST_VARS = [
-  ['围场用户名','paddock_name'], ['围场 ID','paddock_id'], ['赛道名称','track'], ['圈速','lap'], ['版本','version'],
+  ['围场用户名','paddock_name'], ['围场 ID','paddock_id'], ['赛道名称','track'], ['圈速','lap'], ['版本','version'], ['@车手','at_me'],
 ];
 const OPS = [['contains','包含'],['not_contains','不包含'],['equals','等于'],['starts','开头是'],['ends','结尾是']];
 const EVENTS = [['record_alltime','刷新历史纪录'],['record_version','刷新版本纪录']];
