@@ -292,6 +292,8 @@ pub struct MeResp {
     pub username: String,
     pub reg_seq: i64,
     pub has_avatar: bool,
+    /// 版本化头像 URL（?v=avatar_version，客户端磁盘缓存失效开关；无头像=null）
+    pub avatar_url: Option<String>,
     /// 计时赛总积分（与总榜同口径：跨版本 best-of-best 每赛道积分求和；无成绩=0）
     pub total_points: i64,
 }
@@ -303,14 +305,21 @@ pub async fn me(
     headers: axum::http::HeaderMap,
 ) -> Result<Json<MeResp>, ApiError> {
     let user_id = crate::api::laps::authenticate(&state, &headers).await?;
-    let row: Option<(String, i64, bool)> = sqlx::query_as(
-        "SELECT username, reg_seq, (avatar_key IS NOT NULL) FROM users WHERE id = $1",
+    let row: Option<(String, i64, bool, Option<i64>)> = sqlx::query_as(
+        "SELECT username, reg_seq, (avatar_key IS NOT NULL), \
+         CASE WHEN avatar_key IS NOT NULL THEN COALESCE(avatar_version, 0) END \
+         FROM users WHERE id = $1",
     )
     .bind(user_id)
     .fetch_optional(&state.pool)
     .await?;
-    let Some((username, reg_seq, has_avatar)) = row else {
+    let Some((username, reg_seq, has_avatar, avatar_version)) = row else {
         return Err(ApiError::unauthorized("账号不存在，请重新登录"));
+    };
+    let avatar_url = if has_avatar {
+        Some(format!("/v1/avatar/{user_id}?v={}", avatar_version.unwrap_or(0)))
+    } else {
+        None
     };
     // 积分口径与 leaderboard::points_board 总榜分支一致（版本=独立赛季累加 + v40 线性公式）。
     // ⚠️ 窗口函数必须基于全量 best_laps 计算再过滤用户——若把 WHERE user_id 放进
@@ -335,6 +344,7 @@ pub async fn me(
         username,
         reg_seq,
         has_avatar,
+        avatar_url,
         total_points,
     }))
 }

@@ -53,7 +53,7 @@ pub async fn points_board(
                      FROM best_laps WHERE version_code = $1
                    )
                    SELECT u.id AS user_id, u.reg_seq AS reg_seq, u.username AS username,
-                          (CASE WHEN u.avatar_key IS NOT NULL THEN '/v1/avatar/'||u.id END) AS avatar_url,
+                          (CASE WHEN u.avatar_key IS NOT NULL THEN '/v1/avatar/'||u.id||'?v='||COALESCE(u.avatar_version,0) END) AS avatar_url,
                           (CASE WHEN n_in_track = 1 THEN 100
                                 ELSE round((n_in_track + 1 - rank_in_track)::numeric * 100 / n_in_track)
                            END)::bigint AS points
@@ -90,7 +90,7 @@ pub async fn points_board(
                      FROM best_laps
                    )
                    SELECT u.id AS user_id, u.reg_seq AS reg_seq, u.username AS username,
-                          (CASE WHEN u.avatar_key IS NOT NULL THEN '/v1/avatar/'||u.id END) AS avatar_url,
+                          (CASE WHEN u.avatar_key IS NOT NULL THEN '/v1/avatar/'||u.id||'?v='||COALESCE(u.avatar_version,0) END) AS avatar_url,
                           (CASE WHEN n_in_track = 1 THEN 100
                                 ELSE round((n_in_track + 1 - rank_in_track)::numeric * 100 / n_in_track)
                            END)::bigint AS points
@@ -156,7 +156,7 @@ pub async fn track_board(
     }
     let rows: Vec<(Uuid, i64, String, Option<String>, i32)> = match f.version {
         Some(v) => sqlx::query_as(
-            "SELECT b.user_id, u.reg_seq, u.username, (CASE WHEN u.avatar_key IS NOT NULL THEN '/v1/avatar/'||u.id END), b.lap_ms FROM best_laps b JOIN users u ON u.id=b.user_id \
+            "SELECT b.user_id, u.reg_seq, u.username, (CASE WHEN u.avatar_key IS NOT NULL THEN '/v1/avatar/'||u.id||'?v='||COALESCE(u.avatar_version,0) END), b.lap_ms FROM best_laps b JOIN users u ON u.id=b.user_id \
              WHERE b.gp_index=$1 AND b.version_code=$2 ORDER BY b.lap_ms ASC",
         )
         .bind(gp_index)
@@ -166,7 +166,7 @@ pub async fn track_board(
         ?,
         None => {
             sqlx::query_as(
-                "SELECT ub.user_id, u.reg_seq, u.username, (CASE WHEN u.avatar_key IS NOT NULL THEN '/v1/avatar/'||u.id END), ub.lap_ms FROM \
+                "SELECT ub.user_id, u.reg_seq, u.username, (CASE WHEN u.avatar_key IS NOT NULL THEN '/v1/avatar/'||u.id||'?v='||COALESCE(u.avatar_version,0) END), ub.lap_ms FROM \
                  (SELECT user_id, min(lap_ms) AS lap_ms FROM best_laps WHERE gp_index=$1 GROUP BY user_id) ub \
                  JOIN users u ON u.id=ub.user_id ORDER BY ub.lap_ms ASC",
             )

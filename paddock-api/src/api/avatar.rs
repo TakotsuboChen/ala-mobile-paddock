@@ -178,9 +178,13 @@ pub async fn upload_avatar(
     s3_put(&cfg, &key, &content_type, &body)
         .await
         .map_err(|msg| (StatusCode::INTERNAL_SERVER_ERROR, msg))?;
-    sqlx::query("UPDATE users SET avatar_key = $2 WHERE id = $1")
+    // avatar_version = epoch millis：客户端经版本化 URL（?v=）做磁盘缓存失效，
+    // 同版本 URL 不回源——VPS 流量出口优化的服务端半边。
+    let version = chrono::Utc::now().timestamp_millis();
+    sqlx::query("UPDATE users SET avatar_key = $2, avatar_version = $3 WHERE id = $1")
         .bind(user_id)
         .bind(&key)
+        .bind(version)
         .execute(&state.pool)
         .await
         .map_err(|e| {
@@ -219,6 +223,13 @@ pub async fn get_avatar(
         Ok((content_type, bytes)) => {
             let mut headers = HeaderMap::new();
             headers.insert(header::CONTENT_TYPE, HeaderValue::from_str(&content_type).unwrap_or(HeaderValue::from_static("image/jpeg")));
+            // 缓存控制：URL 已带版本号（?v=），同 URL 内容不变 → 允许长缓存。
+            // 服务端不回源 Garage 变更内容（版本号才是失效开关），这里只是给
+            // 未来可能的中间层/浏览器端留余地；模块客户端的磁盘缓存不依赖它。
+            headers.insert(
+                header::CACHE_CONTROL,
+                HeaderValue::from_static("public, max-age=604800, immutable"),
+            );
             (StatusCode::OK, headers, bytes).into_response()
         }
         Err(e) => {
