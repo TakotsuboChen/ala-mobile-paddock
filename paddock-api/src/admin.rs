@@ -1319,6 +1319,9 @@ struct SettingsTemplate {
     bot_app_id: String,
     bot_secret_set: bool,
     rules_json: String,
+    /// 内置动作元数据 JSON（前端渲染动作下拉/失败字段/默认文案的唯一事实源，
+    /// 替代此前 JS 里的 ACTIONS/FAIL_FIELDS/PRESET_FAIL 三份硬编码镜像）。
+    actions_json: String,
 }
 
 async fn settings_page(State(state): State<App>, headers: HeaderMap) -> Response {
@@ -1358,6 +1361,8 @@ async fn render_settings(state: &App) -> Response {
         bot_app_id: app_id,
         bot_secret_set: secret_set,
         rules_json,
+        actions_json: serde_json::to_string(&crate::qq_bot::action_metas())
+            .unwrap_or_else(|_| "[]".into()),
     }
     .render()
     .unwrap();
@@ -1533,7 +1538,14 @@ async fn api_save_rules(
         return api_res(false, "会话已过期，请重新登录");
     }
     for r in &f.rules {
-        let is_action = r.kind == "reply" && (r.action == "reg_code" || r.action == "reset_password");
+        let is_action = r.kind == "reply" && crate::qq_bot::is_action_key(&r.action);
+        // 未知 action（不在 action_metas 表里）：拒绝保存，避免"存了个不执行的动作"
+        // 这类静默失配（旧前端硬编码漂移正是这种后果的温床）。
+        if is_action
+            && !crate::qq_bot::action_metas().iter().any(|m| m.key == r.action)
+        {
+            return api_res(false, format!("未知的动作类型：{}", r.action));
+        }
         let conds_ok = !r.conditions.is_empty() || !r.keyword.trim().is_empty();
         if r.enabled && r.kind == "reply" && !is_action && !conds_ok {
             return api_res(false, "回复规则至少需要一个条件");

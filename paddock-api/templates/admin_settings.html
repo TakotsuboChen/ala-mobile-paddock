@@ -32,7 +32,7 @@
 
 <h3 style="color:#8af;margin-top:2rem">消息配置</h3>
 <p style="color:#777;font-size:.85rem;max-width:640px">
-  被动回复：群消息满足条件时 bot 以<b>引用该消息</b>的形式回复模板。主动播报：满足条件的事件发生时 bot 向勾选的群推送消息（未认证应用主动消息额度极低，可能被平台限流）。多个条件可用「满足全部 / 满足任一」组合；内置动作的触发语义：注册校验=消息含触发词且其后有 #校验码（提不出码静默不响应）；密码重置=消息严格等于触发词，账号按发言者群身份自动匹配。
+  被动回复：群消息满足条件时 bot 以<b>引用该消息</b>的形式回复模板。主动播报：满足条件的事件发生时 bot 向勾选的群推送消息（未认证应用主动消息额度极低，可能被平台限流）。多个条件可用「满足全部 / 满足任一」组合。内置动作的触发语义随动作选择动态显示（如注册校验=消息含触发词且其后有 #校验码，提不出码静默不响应；密码重置/查询用户名=消息严格等于触发词，账号按发言者群身份自动匹配）。
 </p>
 <div style="display:flex;gap:.5rem;margin:.6rem 0;flex-wrap:wrap" id="var-chips"></div>
 <button class="btn primary" onclick="ruleAdd()">新增规则</button>
@@ -61,6 +61,10 @@
 
 <script>
 const RULES = {{ rules_json | safe }};
+// 内置动作元数据：后端 action_metas() 是唯一事实源。动作列表、失败字段、内置默认文案
+// 全部由它派生——前端不再维护 ACTIONS/FAIL_FIELDS/PRESET_FAIL 镜像（曾因三份硬编码
+// 漂移，出现"切到密码重置时预填的是注册校验的失败文案"这类静默错配）。
+const ACTIONS_META = {{ actions_json | safe }};
 // 变量芯片：insert 到当前编辑弹窗的 textarea（varTag 运行时拼接占位符，避开服务端模板语法）
 const REPLY_VARS = [
   ['围场用户名','paddock_name'], ['围场 ID','paddock_id'], ['校验码','code'], ['@车手','at_me'],
@@ -92,20 +96,24 @@ function condText(c){
   }
   return `内容 ${opLabel} "${c.value}"`;
 }
-const ACTIONS = [['reply','普通回复'],['reg_code','注册校验（建号）'],['reset_password','密码重置（发码）']];
-function actionLabel(a){ return (ACTIONS.find(([k])=>k===a)||['',a])[1]; }
-function isActionRule(r){ return r.kind==='reply' && (r.action==='reg_code'||r.action==='reset_password'); }
-// 动作规则的每类失败字段（label + BotRule 字段名）
-const FAIL_FIELDS = {
-  reg_code: [
-    ['invalid_code_template','校验码无效/过期'],
-    ['dup_openid_template','该 QQ 已有在途会话/已绑定'],
-    ['no_identity_template','无法识别群身份'],
-  ],
-  reset_password: [
-    ['no_user_template','未找到发言者绑定的围场账号'],
-  ],
-};
+
+// ---- 动作元数据派生（替代旧硬编码镜像） ----
+// ACTIONS：动作下拉选项；FAIL_FIELDS：{action:[{key,label,default}]}；PRESET_FAIL：{action:{key:default}}
+const ACTIONS = ACTIONS_META.map(m=>[m.key, m.label]);
+const ACTION_BY_KEY = Object.fromEntries(ACTIONS_META.map(m=>[m.key,m]));
+const FAIL_FIELDS = Object.fromEntries(ACTIONS_META.map(m=>[m.key, (m.failure_fields||[]).map(f=>[f.key,f.label])]));
+const PRESET_FAIL = Object.fromEntries(ACTIONS_META.map(m=>[m.key, Object.fromEntries((m.failure_fields||[]).map(f=>[f.key,f.default]))]));
+function actionLabel(a){ const m=ACTION_BY_KEY[a]; return m?m.label:a; }
+function isActionRule(r){ return r.kind==='reply' && r.action && r.action!=='reply'; }
+function matchMode(a){ const m=ACTION_BY_KEY[a]; return m?m.match_mode:'normal'; }
+function actionDesc(a){ const m=ACTION_BY_KEY[a]; return m?m.desc:''; }
+// 触发词输入框的提示：按动作的匹配语义与建码要求差异化
+function keywordHint(a){
+  const mode = matchMode(a);
+  if(a==='reg_code') return '消息含该词且其后带 #校验码才响应；提不出校验码时静默不回复。';
+  if(mode==='exact') return '消息严格等于该词才响应；账号按发言者群身份自动匹配。';
+  return '消息含该词即响应。';
+}
 function renderRules(){
   const box = document.getElementById('rule-list');
   box.innerHTML = RULES.length ? '' : '<p style="color:#777">暂无规则</p>';
@@ -150,9 +158,10 @@ function ruleAdd(){
 let modalKind = 'reply';
 // 变量芯片按场景：成功模板 / 失败模板（code/name 可用）
 function chipsFor(kind, action){
+  const isAct = kind==='reply' && action && action!=='reply';
   const vs = kind==='broadcast' ? BCAST_VARS
-    : (action==='reg_code'||action==='reset_password') ? REPLY_VARS
-    : REPLY_VARS.filter(([l,k])=>k!=='code');
+    : isAct ? REPLY_VARS
+    : REPLY_VARS.filter(([l,k])=>k!=='code'); // 普通回复不提供 code 变量（无校验码来源）
   return vs.map(([label,key])=>`<button type="button" class="btn" style="font-size:.78rem" onclick="insertVar('${key}')">${label}</button>`).join(' ');
 }
 function failChips(){
@@ -163,7 +172,7 @@ function insertFailVar(key){ insertVar(key); }
 function kindSwitch(kind){
   modalKind = kind;
   const action = window._editingRule.action || 'reply';
-  const isAct = kind==='reply' && (action==='reg_code'||action==='reset_password');
+  const isAct = isActionRule({kind, action});
   const show = (id, on)=>{ const el=document.getElementById(id); if(el) el.style.display = on?'block':'none'; };
   show('m-action-wrap', kind==='reply');
   show('m-kw-wrap', isAct);
@@ -199,6 +208,9 @@ function renderCondEditor(){
   if(ma) ma.value = window._editingRule.match_all ? 'and' : 'or';
 }
 // ---- 动作规则的每类失败文案编辑器（预填内置默认） ----
+// ⚠️ 提示：此处是 JS 模板字符串。varTag() 是运行期 JS 求值，不经过 askama 渲染。
+// 旧的 PRESET_FAIL 里写作 varTag('code') 是笔误——它在 JS 模板字符串里原样输出，
+// 用户看到的是 "code" 字面量而非插值标记；现改为运行期 varTag('code') 求值。
 function renderFailFields(){
   const holder = document.getElementById('m-fail-fields');
   if(!holder) return;
@@ -222,23 +234,24 @@ function addCond(){
 }
 function actionSwitch(action){
   if(!window._editingRule) return;
-  // 切动作时预填该动作的失败文案默认值（取内置预设）
+  window._editingRule.action = action;
+  // 切到「内置动作」时：失败文案为空的字段预填后端内置默认；触发词为空则预填该动作的
+  // 建议触发词（新增规则时省手打，已有自定义词不动）。
   const preset = PRESET_FAIL[action] || {};
   for(const [f] of FAIL_FIELDS[action] || []){
     if(!window._editingRule[f]) window._editingRule[f] = preset[f] || '';
   }
+  const kwEl = document.getElementById('m-keyword');
+  if(kwEl && (action==='reg_code'||action==='reset_password'||action==='query_username')){
+    // 触发词只是编辑框状态；用户可改。仅当为空时给推荐值。
+    if(!kwEl.value.trim()) kwEl.value = (SUGGEST_KEYWORD[action]||'');
+  }
+  const hintEl = document.getElementById('m-kw-hint');
+  if(hintEl) hintEl.textContent = keywordHint(action);
   kindSwitch(document.getElementById('m-kind').value);
 }
-// 内置默认失败文案（前端镜像 preset_rules，供"恢复默认"与切动作预填）
-const PRESET_FAIL = {
-  reg_code: {
-    no_code_template: '未识别到校验码：请在「申请围场通行证」后跟 #校验码（模块端申请页可复制完整指令）',
-    invalid_code_template: '校验码 '+varTag('code')+' 无效或已过期，请在围场页重新申请',
-    dup_openid_template: '该 QQ 身份已有其他注册校验在途，请勿重复申请',
-    no_identity_template: '无法识别你的群身份，请确认已在 QQ 群设置中允许机器人获取群信息',
-  },
-  reset_password: { no_user_template: '未找到与你的群身份绑定的围场账号。请确认你已注册，且在本群发送指令（注册时在哪个群校验，就在哪个群申请重置）' },
-};
+// 内置动作的推荐触发词（仅供新增时预填，非强制；后端 preset_rules 用的同值）
+const SUGGEST_KEYWORD = { reg_code:'申请围场通行证', reset_password:'我需要重置密码', query_username:'查询用户名' };
 function ruleModal(r){
   window._editingRule = JSON.parse(JSON.stringify(r));
   if(!window._editingRule.action) window._editingRule.action = 'reply';
@@ -257,9 +270,11 @@ function ruleModal(r){
         <select id="m-action" onchange="actionSwitch(this.value)">
           ${ACTIONS.map(([v,l])=>`<option value="${v}" ${(window._editingRule.action||'reply')===v?'selected':''}>${l}</option>`).join('')}
         </select>
+        <p class="hint" style="color:#888;font-size:.82rem;margin:.3rem 0 0">${actionDesc(window._editingRule.action)}</p>
       </div>
       <div id="m-kw-wrap">
-        <label>触发词（注册校验：消息含该词且其后带 #校验码才响应；密码重置：消息严格等于该词才响应，账号按发言者群身份自动匹配）</label>
+        <label>触发词</label>
+        <p class="hint" id="m-kw-hint" style="color:#888;font-size:.82rem;margin:.2rem 0">${keywordHint(window._editingRule.action)}</p>
         <input id="m-keyword" value="${(window._editingRule.keyword||'').replaceAll('"','&quot;')}">
       </div>
       <div id="m-cond-wrap">
@@ -281,10 +296,12 @@ function ruleModal(r){
     okText: '保存规则',
     onOk: async (mask)=>{
       const kind = mask.querySelector('#m-kind').value;
-      const action = kind==='reply' ? (mask.querySelector('#m-action')?.value||'reply') : 'reply';
+      // ⚠️ 播报规则必须把 action 归零——旧实现无条件回写 'reply'，导致每条播报都带
+      // 一个无意义的 action:'reply'（展示成"播报 · 普通回复"的脏数据来源）。
+      const action = kind==='reply' ? (mask.querySelector('#m-action')?.value||'reply') : '';
       const template = mask.querySelector('#m-template').value;
       const fail_template = mask.querySelector('#m-fail')?.value||'';
-      const isAct = kind==='reply' && (action==='reg_code'||action==='reset_password');
+      const isAct = kind==='reply' && action && action!=='reply';
       const match_all = mask.querySelector('#m-match-all').value==='and';
       const keyword = mask.querySelector('#m-keyword')?.value.trim()||'';
       const src = window._editingRule;
@@ -295,6 +312,10 @@ function ruleModal(r){
       if(isAct && !keyword) throw new Error('内置动作规则必须填写触发词（提取锚点）');
       const target = r.id ? RULES.find(x=>x.id===r.id) : null;
       const patch = {kind, action, keyword, conditions, match_all, template, fail_template};
+      // 失败字段：按动作元数据整表写入（保留用户已填值）；切回普通回复时清空，
+      // 避免残留字段在下次切换动作时被当成"用户已配置"。
+      const keys = Object.keys(PRESET_FAIL).flatMap(a=>(FAIL_FIELDS[a]||[]).map(([f])=>f));
+      for(const f of keys) patch[f] = '';
       for(const [f] of (isAct ? FAIL_FIELDS[action] : [])) patch[f] = src[f]||'';
       if(target){ Object.assign(target, patch); }
       else { RULES.push({id: 'r'+Date.now(), ...patch, enabled: true}); }

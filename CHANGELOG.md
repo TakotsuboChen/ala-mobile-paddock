@@ -10,6 +10,21 @@
 
 ## [Unreleased]
 
+### Added
+- bot 内置动作 **`query_username`（查询用户名）**：群内发「查询用户名」严格匹配 → 按发言者群身份反查账号回复用户名（单聊引导回群）；预设规则 `preset-query-name`；模块端围场页新增「忘记用户名？」弹窗
+- `qq_bot::action_metas()` —— 内置动作元数据（触发语义/匹配方式/失败字段/内置默认文案）**单一事实源**，经管理端设置页整表注入前端渲染，前端不再维护镜像
+
+### Fixed
+- **普通回复身份依赖兜底**：模板含 `{{paddock_name}}/{{paddock_id}}/{{at_me}}` 而发言者账号查不到时，改走 `no_user_template`（未注册）/`no_identity_template`（无群身份），不再把空串渲染进模板（旧行为回「用户名是「」」）
+- 管理端动作选择器**静默发起**：切动作时动作值未写回 `_editingRule`，`onOk` 读的是 select 现值而非编辑中对象，导致动作切换可能不落库
+- 管理端播报规则 `action` 脏值：旧前端无条件写入 `action:'reply'`，播报规则展示成「播报 · 普通回复」；保存侧归零 + `load_rules` 一次修复
+- `load_rules` 播报文案迁移改用 **id 查预设**（原按下标 `preset_rules()[2]/[3]`，preset 追加条目后下标漂移会取错模板）
+
+### Changed
+- 管理端规则编辑器去镜像化：`ACTIONS`/`FAIL_FIELDS`/`PRESET_FAIL`/`isActionRule`/`keywordHint` 全部由 `ACTIONS_META` 派生；动作下拉附语义说明、触发词附按 `match_mode` 差异化的提示文案
+- 失败字段键改为 x-template 通用清空（按动作元数据全表遍历），避免切动作残留旧字段
+- bot 失败文案内置默认统一以 `action_metas()` 为准（`fail_default`），用户 2026-09-12 在管理端编辑的版本已设为默认基线
+
 ## [1.0.1] - 2026-09-05
 
 ### Fixed
