@@ -177,6 +177,8 @@ function kindSwitch(kind){
   show('m-action-wrap', kind==='reply');
   show('m-kw-wrap', isAct);
   show('m-cond-wrap', kind==='broadcast' || (kind==='reply' && !isAct));
+  // 金标模板只对主动播报有意义（"零辅助"是圈的成绩属性，回复规则用不上）
+  show('m-gold-wrap', kind==='broadcast');
   show('m-fail-wrap', isAct);
   show('m-fail-generic-wrap', kind==='reply' && !isAct);
   const v = document.getElementById('m-vars');
@@ -284,6 +286,11 @@ function ruleModal(r){
         <button type="button" class="btn" onclick="addCond()">+ 添加条件</button>
       </div>
       <label>${isAct?'成功文案':'消息模板'}</label><textarea id="m-template" rows="3" style="width:100%;box-sizing:border-box;padding:.5rem;border:1px solid #444;border-radius:8px;background:#2a2a2c;color:#eee;font-family:inherit">${r.template.replaceAll('<','&lt;')}</textarea>
+      <div id="m-gold-wrap">
+        <label style="color:#daa520;margin-top:1rem">金标模板（仅主动播报；刷新纪录的圈为零辅助时改用它）</label>
+        <textarea id="m-gold" rows="4" style="width:100%;box-sizing:border-box;padding:.5rem;border:1px solid #444;border-radius:8px;background:#2a2a2c;color:#eee;font-family:inherit">${(r.gold_template||'').replaceAll('<','&lt;')}</textarea>
+        <p class="hint" style="color:#888;font-size:.82rem">留空 = 不区分零辅助，恒用上面的模板。零辅助 = 该圈 TC 与 ABS 全关（踏板不计）。配置缺失的旧记录一律走普通模板。</p>
+      </div>
       <div id="m-fail-wrap">
         <label style="color:#faa;margin-top:1rem">失败文案（每类失败独立，可编辑；code 变量 = 校验码，name 变量 = 用户名）</label>
         <div id="m-fail-fields"></div>
@@ -300,6 +307,9 @@ function ruleModal(r){
       // 一个无意义的 action:'reply'（展示成"播报 · 普通回复"的脏数据来源）。
       const action = kind==='reply' ? (mask.querySelector('#m-action')?.value||'reply') : '';
       const template = mask.querySelector('#m-template').value;
+      // 金标模板仅对播报有意义（回复规则没有"零辅助"这个概念）——非播报一律清空，
+      // 避免切换类型时残留脏字段（同 action 归零、失败字段清空的既有约定）。
+      const gold_template = kind==='broadcast' ? (mask.querySelector('#m-gold')?.value||'') : '';
       const fail_template = mask.querySelector('#m-fail')?.value||'';
       const isAct = kind==='reply' && action && action!=='reply';
       const match_all = mask.querySelector('#m-match-all').value==='and';
@@ -311,7 +321,7 @@ function ruleModal(r){
       if(!template.trim()) throw new Error('消息模板不能为空');
       if(isAct && !keyword) throw new Error('内置动作规则必须填写触发词（提取锚点）');
       const target = r.id ? RULES.find(x=>x.id===r.id) : null;
-      const patch = {kind, action, keyword, conditions, match_all, template, fail_template};
+      const patch = {kind, action, keyword, conditions, match_all, template, gold_template, fail_template};
       // 失败字段：按动作元数据整表写入（保留用户已填值）；切回普通回复时清空，
       // 避免残留字段在下次切换动作时被当成"用户已配置"。
       const keys = Object.keys(PRESET_FAIL).flatMap(a=>(FAIL_FIELDS[a]||[]).map(([f])=>f));

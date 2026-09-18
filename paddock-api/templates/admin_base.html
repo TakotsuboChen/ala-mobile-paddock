@@ -22,6 +22,11 @@
   .btn.primary{background:#4c8dff}
   .notice{background:#243; color:#cfc; padding:.5rem .8rem;border-radius:8px;margin-bottom:.8rem}
   .code{font-family:ui-monospace,monospace}
+  /* 成绩页"配置"列：比 code 小的辅助读数，允许换行（三维读数较长） */
+  td.assist{font-size:.84rem;color:#bbb;white-space:normal;max-width:16rem}
+  /* 编辑/添加弹窗的三组辅助下拉（各占一行，标签在上） */
+  .assist-inputs{margin-top:.6rem;border-top:1px solid #333;padding-top:.6rem}
+  .assist-inputs label{display:block;color:#8af;font-size:.84rem;margin:.5rem 0 .15rem}
   form.inline{display:inline}
   /* ---- 页内弹窗（自绘 modal，非浏览器 confirm） ---- */
   .modal-mask{position:fixed;inset:0;background:rgba(0,0,0,.6);display:flex;align-items:center;justify-content:center;z-index:100}

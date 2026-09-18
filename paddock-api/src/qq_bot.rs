@@ -66,6 +66,13 @@ pub struct BotRule {
     #[serde(default = "default_true")]
     pub match_all: bool,
     pub template: String,
+    /// **金标模板**（仅 broadcast 规则用）：当刷新的那条圈是"零辅助"（TC 与 ABS
+    /// 全关）时改用本模板，否则用 [template]。留空 = 不区分，恒用 [template]。
+    ///
+    /// 为什么是独立字段而不是在 template 里插变量：金标文案往往需要**完全不同的
+    /// 排版与措辞**（用户实测文案是多行 + 金标认证句），变量替换表达不了"整段换掉"。
+    #[serde(default)]
+    pub gold_template: String,
     /// 通用失败模板（可 {{code}}/{{name}}）；仅在对应类型独立文案为空时使用
     #[serde(default)]
     pub fail_template: String,
@@ -224,6 +231,7 @@ fn preset_rules() -> Vec<BotRule> {
             conditions: vec![],
             match_all: true,
             template: "校验成功，欢迎「{{paddock_name}}」加入 CAMDA，您已是围场第 {{paddock_id}} 位车手！请返回模块直接点击登录。".into(),
+            gold_template: String::new(),
             fail_template: String::new(),
             invalid_code_template: fail_default("reg_code", "invalid_code_template"),
             dup_openid_template: fail_default("reg_code", "dup_openid_template"),
@@ -239,6 +247,7 @@ fn preset_rules() -> Vec<BotRule> {
             conditions: vec![],
             match_all: true,
             template: "车手「{{paddock_name}}」，您的重置码已生成：\n\n{{code}}\n\n30 分钟内有效，请在围场页用「忘记密码」功能提交新密码。".into(),
+            gold_template: String::new(),
             fail_template: String::new(),
             invalid_code_template: String::new(),
             dup_openid_template: String::new(),
@@ -254,6 +263,7 @@ fn preset_rules() -> Vec<BotRule> {
             conditions: vec![],
             match_all: true,
             template: "您的围场用户名是「{{paddock_name}}」。".into(),
+            gold_template: String::new(),
             fail_template: String::new(),
             invalid_code_template: String::new(),
             dup_openid_template: String::new(),
@@ -273,6 +283,7 @@ fn preset_rules() -> Vec<BotRule> {
             }],
             match_all: true,
             template: "{{paddock_id}} 号车手「{{paddock_name}}」刚刚在{{track}}跑出 {{lap}}，刷新了全服历史最快圈速！".into(),
+            gold_template: "# 纪录快讯\n{{at_me}}\n{{paddock_id}} 号车手\n***{{paddock_name}}***\n{{track}}\n{{lap}}\n刷新了全服历史最快圈速！\n本圈辅助全关，获得金标认证！".into(),
             fail_template: String::new(),
             invalid_code_template: String::new(),
             dup_openid_template: String::new(),
@@ -292,6 +303,7 @@ fn preset_rules() -> Vec<BotRule> {
             }],
             match_all: true,
             template: "{{paddock_id}} 号车手「{{paddock_name}}」刚刚在{{track}}跑出 {{lap}}，刷新了 {{version}} 版本的全服最快圈速！".into(),
+            gold_template: "# 纪录快讯\n{{at_me}}\n{{paddock_id}} 号车手\n***{{paddock_name}}***\n{{track}}\n{{lap}}\n刷新了 {{version}} 版本的全服最快圈速！\n本圈辅助全关，获得金标认证！".into(),
             fail_template: String::new(),
             invalid_code_template: String::new(),
             dup_openid_template: String::new(),
@@ -329,8 +341,7 @@ pub async fn load_rules(pool: &PgPool) -> Vec<BotRule> {
         // keyword 仍为旧默认值的规则（用户自定义词视为有意保留，不动）。
         if r.action == "reset_password" && r.keyword.trim() == "重置密码" {
             r.keyword = "我需要重置密码".into();
-        }
-        // 脏值修复（2026-09-12）：播报规则的 action 曾被前端硬编码默认写成 "reply"。
+        }        // 脏值修复（2026-09-12）：播报规则的 action 曾被前端硬编码默认写成 "reply"。
         // 非 reply 类规则的 action 无意义 → 归零，避免管理端数据显示"播报 · 普通回复"。
         if r.kind != "reply" && !r.action.is_empty() {
             r.action = String::new();
@@ -345,6 +356,15 @@ pub async fn load_rules(pool: &PgPool) -> Vec<BotRule> {
             } else if r.template == "{{paddock_id}} 号车手「{{paddock_name}}」刚刚在{{track}}跑出{{lap}}，刷新了{{version}}版本的全服最快圈速！" {
                 r.template = preset_by_id("preset-bc-version").template;
             }
+            // 一次性补充迁移（2026-09-18，金标模板引入）：库里的播报规则是**上线时
+            // 整份写入**的（见 v35+ 的"key 存在即用户数据"约定），新加的 gold_template
+            // 字段在旧 JSON 里反序列化成空串 → 金标播报永不触发。
+            //
+            // ⚠️ 不能在这里就地补：load_rules 每次播报都要调用，"每次读都补空值"
+            // 会让**用户手工清空**（表示不要金标播报）在下一轮被悄悄填回来——
+            // "字段从未存在"与"用户清空"在 JSON 里无法区分。故改用**一次性标记**：
+            // 只补一次，补完写下标记，此后用户怎么改都不再被覆盖。
+            // 见 [`migrate_gold_templates_once`]。
         }
         // 旧 keyword 格式迁移：普通回复/播报合成 conditions；
         // 动作规则（有执行语义的 action）触发词即条件，不生成条件行
@@ -363,6 +383,57 @@ pub async fn load_rules(pool: &PgPool) -> Vec<BotRule> {
     rules
 }
 
+/// 一次性补充迁移：给库里已有的内置播报规则补上 `gold_template`（2026-09-18 引入）。
+///
+/// ## 为什么必须"一次性"而不是在 `load_rules` 里就地补
+///
+/// `load_rules` 每次播报都会调用。若在那里"见空就补"，**用户手工清空金标模板**
+/// （表示"我不要金标播报"）会在下一轮被无声填回——而"字段从未存在"与"用户清空"
+/// 在 JSON 里都是空串，无法区分。故本函数只跑一次，跑完在 configs 表写下标记，
+/// 此后用户怎么改都不再被覆盖（与 bot 规则"key 存在即用户数据"同一原则）。
+///
+/// ## 只补内置条目
+///
+/// 按 `preset_by_id(r.id)` 命中才补：用户自建的播报规则 id 是 `r<timestamp>`，
+/// 匹配不到预设 → 保持为空（用户没写过，也不该替他编）。补完的结果立即落库。
+pub async fn migrate_gold_templates_once(pool: &PgPool) {
+    const MARK: &str = "bot_gold_template_migrated_v1";
+    if get_cfg(pool, MARK).await.is_some_and(|v| !v.is_empty()) {
+        return;
+    }
+    // 读**原样**规则（不跑等值迁移、不回落预设）——迁移必须作用在库里真实数据上
+    let raw = get_cfg(pool, RULES_CFG_KEY).await;
+    if let Some(s) = raw.as_ref().filter(|s| !s.is_empty()) {
+        if let Ok(mut rules) = serde_json::from_str::<Vec<BotRule>>(s) {
+            let mut changed = false;
+            for r in &mut rules {
+                if r.kind != "broadcast" || !r.gold_template.trim().is_empty() {
+                    continue;
+                }
+                let preset = preset_by_id(&r.id);
+                if preset.kind == "broadcast" && !preset.gold_template.is_empty() {
+                    r.gold_template = preset.gold_template;
+                    changed = true;
+                    tracing::info!("[qq_bot] 已为播报规则 {} 补上预设金标模板", r.id);
+                }
+            }
+            if changed {
+                if let Err(e) = save_rules(pool, &rules).await {
+                    tracing::error!("[qq_bot] 金标模板迁移写库失败（下次启动重试）: {e}");
+                    return; // 不写标记 → 下次启动重试
+                }
+            }
+        } else {
+            // 解析失败：不写标记，下次启动重试（保住库内原文，勿覆盖）
+            tracing::error!("[qq_bot] 金标模板迁移跳过：规则 JSON 无法解析");
+            return;
+        }
+    }
+    if let Err(e) = set_cfg(pool, MARK, "1").await {
+        tracing::error!("[qq_bot] 金标模板迁移标记写入失败: {e}");
+    }
+}
+
 /// 按 id 取预设规则（文案迁移用；缺失时返回空规则兜底，绝不 panic）。
 fn preset_by_id(id: &str) -> BotRule {
     preset_rules()
@@ -376,6 +447,7 @@ fn preset_by_id(id: &str) -> BotRule {
             conditions: vec![],
             match_all: true,
             template: String::new(),
+            gold_template: String::new(),
             fail_template: String::new(),
             invalid_code_template: String::new(),
             dup_openid_template: String::new(),
@@ -501,6 +573,9 @@ pub struct BroadcastVars {
     pub paddock_name: String,
     pub paddock_id: String,
     pub at_me: String,
+    /// 这条纪录的圈是否零辅助（TC 与 ABS 全关）——决定用 `template` 还是
+    /// `gold_template`。配置缺失（旧模块上传/旧记录）一律 false。
+    pub is_gold: bool,
 }
 
 /// 删除场景专用：仅当删除导致该维度纪录变化（值变或易主）才播报。
@@ -568,6 +643,7 @@ async fn broadcast_current_record(state: &App, gp_index: i16, version_code: i32,
     .fetch_one(&state.pool)
     .await
     .unwrap_or((String::new(), 0, String::new()));
+    let is_gold = is_zero_assist_lap(state, gp_index, Some(version_code), holder, lap_ms).await;
     broadcast(
         state,
         event,
@@ -578,6 +654,7 @@ async fn broadcast_current_record(state: &App, gp_index: i16, version_code: i32,
             at_me: at_user(&holder_openid, &username),
             paddock_name: username,
             paddock_id: reg_seq.to_string(),
+            is_gold,
         },
     )
     .await;
@@ -629,6 +706,16 @@ pub async fn broadcast_lap_change(state: &App, gp_index: i16, version_code: i32,
     .await
     .unwrap_or((String::new(), 0, String::new()));
     let event = if alltime_hit { "record_alltime" } else { "record_version" };
+    // 金标判定：历史纪录跨版本、records 不存 alltime 的版本号 → 传 None 按
+    // (gp, user, lap_ms) 定位；版本纪录传具体版本更精确。
+    let is_gold = is_zero_assist_lap(
+        state,
+        gp_index,
+        if alltime_hit { None } else { Some(version_code) },
+        holder_id,
+        holder_ms,
+    )
+    .await;
     broadcast(
         state,
         event,
@@ -639,9 +726,70 @@ pub async fn broadcast_lap_change(state: &App, gp_index: i16, version_code: i32,
             at_me: at_user(&holder_openid, &username),
             paddock_name: username,
             paddock_id: reg_seq.to_string(),
+            is_gold,
         },
     )
     .await;
+}
+
+/// 判定"刷新纪录的那条圈"是否零辅助（TC 与 ABS 均关）——决定播报用普通模板还是金标模板。
+///
+/// 数据源是 `laps` 全量留档（那里存原始五维），不是 best_laps（那是"该维度最快圈"，
+/// 与"本条纪录圈"在删除/易主场景可能不是同一条）。配置缺失（旧模块上传）→ false。
+///
+/// `version_code = None` 用于历史（alltime）纪录：records 表不存 alltime 行的版本，
+/// 且跨版本比对时上传方的 version_code 未必是创纪录那条圈的版本——用
+/// (gp, user, lap_ms) 三键定位更稳，同值同人的歧义由 ORDER BY created_at DESC 兜住。
+async fn is_zero_assist_lap(
+    state: &App,
+    gp_index: i16,
+    version_code: Option<i32>,
+    user_id: Uuid,
+    lap_ms: i32,
+) -> bool {
+    let row: Option<(Option<String>, Option<String>, Option<String>, Option<String>)> =
+        match version_code {
+            Some(vc) => {
+                sqlx::query_as(
+                    "SELECT tc_mode, tc_strength, abs_mode, abs_strength FROM laps \
+                     WHERE gp_index=$1 AND version_code=$2 AND user_id=$3 AND lap_ms=$4 \
+                     ORDER BY created_at DESC LIMIT 1",
+                )
+                .bind(gp_index)
+                .bind(vc)
+                .bind(user_id)
+                .bind(lap_ms)
+                .fetch_optional(&state.pool)
+                .await
+                .ok()
+                .flatten()
+            }
+            None => {
+                sqlx::query_as(
+                    "SELECT tc_mode, tc_strength, abs_mode, abs_strength FROM laps \
+                     WHERE gp_index=$1 AND user_id=$2 AND lap_ms=$3 \
+                     ORDER BY created_at DESC LIMIT 1",
+                )
+                .bind(gp_index)
+                .bind(user_id)
+                .bind(lap_ms)
+                .fetch_optional(&state.pool)
+                .await
+                .ok()
+                .flatten()
+            }
+        };
+    let Some((tcm, tcs, absm, abss)) = row else {
+        return false;
+    };
+    let f = crate::api::laps::flags_of(
+        None,
+        tcm.as_deref(),
+        tcs.as_deref(),
+        absm.as_deref(),
+        abss.as_deref(),
+    );
+    f.is_zero_assist()
 }
 
 fn render(template: &str, pairs: &[(&str, &str)]) -> String {
@@ -674,7 +822,10 @@ pub async fn broadcast(state: &App, event: &str, vars: &BroadcastVars) {
         if !rule_matches(r, "", event) {
             continue;
         }
-        let content = render(&r.template, &[
+        // 金标模板：刷新纪录的圈为零辅助时改用它（留空 = 不区分，仍用 template）。
+        let use_gold = vars.is_gold && !r.gold_template.trim().is_empty();
+        let tpl = if use_gold { &r.gold_template } else { &r.template };
+        let content = render(tpl, &[
             ("track", vars.track.as_str()),
             ("lap", vars.lap.as_str()),
             ("version", vars.version.as_str()),

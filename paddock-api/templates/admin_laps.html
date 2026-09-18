@@ -19,21 +19,23 @@
   <button type="button" class="btn primary" onclick="lapAdd()">添加成绩</button>
 </form>
 <table id="lap-table">
-<tr><th>时间</th><th>用户</th><th>赛道</th><th>版本</th><th>圈速</th><th>操作</th></tr>
+<tr><th>时间</th><th>用户</th><th>赛道</th><th>版本</th><th>圈速</th><th>配置</th><th>操作</th></tr>
 {% for l in rows %}
-<tr data-id="{{ l.id }}" data-ms="{{ l.lap_ms_raw }}" data-user="{{ l.username }}">
+<tr data-id="{{ l.id }}" data-ms="{{ l.lap_ms_raw }}" data-user="{{ l.username }}"
+    data-pedal="{{ l.pedal_token }}" data-tc="{{ l.tc_token }}" data-abs="{{ l.abs_token }}">
   <td class="code">{{ l.created }}</td>
   <td>{{ l.username }}</td>
   <td>{{ l.track }}</td>
   <td class="code">{{ l.version_name }}</td>
   <td class="code">{{ l.lap_display }}</td>
+  <td class="assist">{{ l.assist }}</td>
   <td>
     <button class="btn" onclick="lapEdit(this.closest('tr'))">编辑</button>
     <button class="btn danger" onclick="lapDelete(this.closest('tr'))">删除</button>
   </td>
 </tr>
 {% endfor %}
-{% if rows.is_empty() %}<tr><td colspan="6" style="color:#777;white-space:normal">无成绩记录</td></tr>{% endif %}
+{% if rows.is_empty() %}<tr><td colspan="7" style="color:#777;white-space:normal">无成绩记录</td></tr>{% endif %}
 </table>
 <div class="pager" id="lap-pager"></div>
 <script>
@@ -70,14 +72,44 @@ function readLap(mask){
   if(min===0 && sec===0 && ms===0) throw new Error('圈速必须大于 0');
   return {min, sec, ms};
 }
+/**
+ * 辅助配置三组下拉（踏板 / TC / ABS）。**每个维度都含"缺失"选项（value=""）**——
+ * 旧记录与旧版模块上传的圈就是缺失，管理员既可以为它们补填，也可以把误填的清回缺失。
+ *
+ * ⚠️ TC/ABS 是**单一下拉**（不是"模式 + 档位"两组）：未开自定义（游戏默认）与
+ * "最高档"在计分上完全等价、用户语义也是"默认就是最高"，合并成一维才不会让管理员
+ * 陷入"默认 / 最高 到底选哪个"的困惑。展示列与编辑值是同一套 token。
+ *
+ * 表中的 value 必须与服务端 `laps::PEDAL_TOKENS` / `STRENGTH_TOKENS` 逐字对齐。
+ */
+const PEDAL_TOKENS = [['','缺失'],['off','原生按键'],['single','单踏板'],['dual','双踏板']];
+const STRENGTH_TOKENS = [['','缺失'],['off','关'],['weak','低'],['medium','中'],['strong','高'],['stock','最高']];
+function assistInputs(v){
+  v = v || {};
+  const opts = (list, cur) => list.map(([k,d]) =>
+    `<option value="${k}" ${cur===k?'selected':''}>${d}</option>`).join('');
+  return `<div class="assist-inputs">
+    <label>踏板</label>
+    <select id="m-pedal" style="width:100%;padding:.4rem;border-radius:6px;border:1px solid #444;background:#2a2a2c;color:#eee">${opts(PEDAL_TOKENS, v.pedal||'')}</select>
+    <label>TC</label>
+    <select id="m-tc" style="width:100%;padding:.4rem;border-radius:6px;border:1px solid #444;background:#2a2a2c;color:#eee">${opts(STRENGTH_TOKENS, v.tc||'')}</select>
+    <label>ABS</label>
+    <select id="m-abs" style="width:100%;padding:.4rem;border-radius:6px;border:1px solid #444;background:#2a2a2c;color:#eee">${opts(STRENGTH_TOKENS, v.abs||'')}</select>
+    <p class="hint">"最高" = 未调低辅助（含游戏默认）。缺失 = 旧记录/未上报，不计加分。</p>
+  </div>`;
+}
+function readAssist(){
+  const g = (id)=>document.getElementById(id)?.value || '';
+  return { pedal_token: g('m-pedal'), tc_token: g('m-tc'), abs_token: g('m-abs') };
+}
 function lapEdit(tr){
   const id = tr.dataset.id, ms = parseInt(tr.dataset.ms), user = tr.dataset.user;
   openModal({
     title: `编辑成绩 · ${user}`,
-    body: `<p class="hint">原圈速 ${tr.children[4].textContent}，改后自动重算榜单/纪录。</p>${lapInputs(ms)}`,
+    body: `<p class="hint">原圈速 ${tr.children[4].textContent}，改后自动重算榜单/纪录；配置同时可补填（旧记录可在此补上使用情况）。</p>${lapInputs(ms)}${assistInputs({pedal:tr.dataset.pedal, tc:tr.dataset.tc, abs:tr.dataset.abs})}`,
     okText: '保存',
     onOk: async (mask)=>{
-      const msg = await api(`/admin/api/laps/${id}/edit`, readLap(mask));
+      const msg = await api(`/admin/api/laps/${id}/edit`, {...readLap(mask), ...readAssist()});
       await refreshPage();
       return msg;
     }
@@ -107,7 +139,8 @@ function lapAdd(){
         <option value="200150" selected>8.0.6</option>
         <option value="200146">8.0.4</option>
       </select>
-      <label>圈速</label>${lapInputs()}`,
+      <label>圈速</label>${lapInputs()}
+      ${assistInputs()}`,
     okText: '添加',
     onOk: async (mask)=>{
       const gp = parseInt(trackC.value);
@@ -116,7 +149,8 @@ function lapAdd(){
         username: userC.value,
         gp_index: gp,
         version_code: parseInt(document.getElementById('m-version').value, 10),
-        ...readLap(mask)
+        ...readLap(mask),
+        ...readAssist()
       };
       const msg = await api('/admin/api/laps/add', body);
       await refreshPage();

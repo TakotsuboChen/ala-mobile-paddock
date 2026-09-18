@@ -1,4 +1,4 @@
-<h2>用户管理（{{ users.len() }}）</h2>
+{% if q.is_empty() %}<h2>用户管理（{{ total }}）</h2>{% else %}<h2>用户管理（{{ total }} · 筛选「{{ q }}」）</h2>{% endif %}
 <form method="get" action="/admin/users" style="margin-bottom:.8rem;display:flex;gap:.6rem;align-items:center">
   <input name="q" value="{{ q }}" placeholder="按用户名搜索" style="padding:.4rem;border-radius:6px;border:1px solid #444;background:#2a2a2c;color:#eee">
   <button class="btn">搜索</button>

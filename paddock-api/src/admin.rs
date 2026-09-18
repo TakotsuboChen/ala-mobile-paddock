@@ -99,6 +99,10 @@ struct UsersTemplate {
     page: i64,
     size: i64,
     pages: i64,
+    /// 当前筛选条件下的**总人数**（不是本页条数）。
+    /// ⚠️ 标题"用户管理（N）"必须用这个：模板里若写 `users.len()` 拿到的是
+    /// 本页条数（页大小 30），标题会随翻页变化——那是 bug 不是特性。
+    total: i64,
 }
 
 struct LapRow {
@@ -109,6 +113,14 @@ struct LapRow {
     lap_display: String,
     lap_ms_raw: i32,
     created: String,
+    /// 辅助配置三维展示：`双踏板 / 关 / 最高`。缺失维显示"缺失"（旧记录/旧版模块）。
+    assist: String,
+    /// 三维 token（踏板/TC/ABS；`""` = 缺失），编辑弹窗下拉回填用。
+    /// token 是展示层粒度：`stock` 已把 `mode=default` 与 `custom+stock` 合并
+    ///（计分等价，用户语义也是"默认就是最高"）——见 laps::assist_tokens。
+    pedal_token: String,
+    tc_token: String,
+    abs_token: String,
 }
 
 #[derive(Template)]
@@ -315,7 +327,8 @@ async fn fetch_laps(
         q.fetch_one(pool).await.unwrap_or(0)
     };
     let mut select_sql = String::from(
-        "SELECT l.id, u.username, l.gp_index, l.version_code, l.lap_ms, l.created_at \
+        "SELECT l.id, u.username, l.gp_index, l.version_code, l.lap_ms, l.created_at, \
+                l.pedal_mode, l.tc_mode, l.tc_strength, l.abs_mode, l.abs_strength \
          FROM laps l JOIN users u ON u.id=l.user_id WHERE ",
     );
     select_sql.push_str(&where_sql);
@@ -324,7 +337,19 @@ async fn fetch_laps(
         next_ph,
         next_ph + 1
     ));
-    let mut q = sqlx::query_as::<_, (Uuid, String, i16, i32, i32, chrono::DateTime<chrono::Utc>)>(&select_sql);
+    let mut q = sqlx::query_as::<_, (
+        Uuid,
+        String,
+        i16,
+        i32,
+        i32,
+        chrono::DateTime<chrono::Utc>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+    )>(&select_sql);
     q = q.bind(&like);
     if let Some(v) = version { q = q.bind(v); }
     if let Some(g) = gp_index { q = q.bind(g); }
@@ -335,15 +360,39 @@ async fn fetch_laps(
         .await
         .unwrap_or_default()
         .into_iter()
-        .map(|(id, name, gp, ver, ms, created)| LapRow {
-            id: id.to_string(),
-            username: name,
-            track: track_display_name(gp).to_string(),
-            version_name: crate::api::laps::version_display(ver),
-            lap_display: crate::api::leaderboard::format_lap_ms(ms),
-            lap_ms_raw: ms,
-            created: bj_time(created).format("%Y-%m-%d %H:%M:%S").to_string(),
-        })
+        .map(
+            |(id, name, gp, ver, ms, created, pedal, tcm, tcs, absm, abss)| {
+                let (pedal_d, tc_d, abs_d) = crate::api::laps::assist_display(
+                    pedal.as_deref(),
+                    tcm.as_deref(),
+                    tcs.as_deref(),
+                    absm.as_deref(),
+                    abss.as_deref(),
+                );
+                // token 版（编辑弹窗回填）：与上面展示同一套折叠规则，
+                // 保证"看到什么就编辑什么"——不会出现列里写"最高"、下拉却是"自定义/最高"。
+                let (p_tok, tc_tok, abs_tok) = crate::api::laps::assist_tokens(
+                    pedal.as_deref(),
+                    tcm.as_deref(),
+                    tcs.as_deref(),
+                    absm.as_deref(),
+                    abss.as_deref(),
+                );
+                LapRow {
+                    id: id.to_string(),
+                    username: name,
+                    track: track_display_name(gp).to_string(),
+                    version_name: crate::api::laps::version_display(ver),
+                    lap_display: crate::api::leaderboard::format_lap_ms(ms),
+                    lap_ms_raw: ms,
+                    created: bj_time(created).format("%Y-%m-%d %H:%M:%S").to_string(),
+                    assist: format!("{pedal_d} / {tc_d} / {abs_d}"),
+                    pedal_token: p_tok,
+                    tc_token: tc_tok,
+                    abs_token: abs_tok,
+                }
+            },
+        )
         .collect();
     (rows, total)
 }
@@ -510,6 +559,7 @@ async fn users_page(
         page: pq.page,
         size: pq.size,
         pages: ((total + pq.size - 1) / pq.size).max(1),
+        total,
     }
     .render()
     .unwrap();
@@ -1002,6 +1052,15 @@ struct ApiEditLap {
     min: i32,
     sec: i32,
     ms: i32,
+    /// 辅助配置三维 token（踏板 / TC / ABS），空串 = 缺失。
+    /// 单一 token 而非"模式+档位"两维：`stock` 已代表"未调低辅助"（含游戏默认），
+    /// 与展示列同一粒度——见 laps::tokens_to_raw。
+    #[serde(default)]
+    pedal_token: String,
+    #[serde(default)]
+    tc_token: String,
+    #[serde(default)]
+    abs_token: String,
 }
 
 /// 编辑圈速（改 lap_ms）→ 同事务重算 best_laps/records。
@@ -1018,7 +1077,17 @@ async fn api_edit_lap(
         return api_res(false, "时间分段非法（分 0–59，秒 0–59，毫秒 0–999）");
     }
     let new_ms = f.min * 60_000 + f.sec * 1000 + f.ms;
-    match recalc_edit(&state.pool, lap_id, new_ms, &admin).await {
+    // 三维 token → 原始五维（`stock` 展开为 mode=default，见 tokens_to_raw）。
+    let (pedal, tcm, tcs, absm, abss) =
+        crate::api::laps::tokens_to_raw(&f.pedal_token, &f.tc_token, &f.abs_token);
+    let assist = crate::score::AssistConfig {
+        pedal_mode: pedal,
+        tc_mode: tcm,
+        tc_strength: tcs,
+        abs_mode: absm,
+        abs_strength: abss,
+    };
+    match recalc_edit(&state.pool, lap_id, new_ms, &assist, &admin).await {
         Ok(Some((gp, ver))) => {
             crate::qq_bot::broadcast_lap_change(&state, gp, ver, new_ms).await;
             api_res(true, format!("圈速已改为 {} 并重算", crate::api::leaderboard::format_lap_ms(new_ms)))
@@ -1060,6 +1129,13 @@ struct ApiAddLap {
     min: i32,
     sec: i32,
     ms: i32,
+    /// 辅助配置三维 token（补录时手填；空串 = 缺失，不计加分）
+    #[serde(default)]
+    pedal_token: String,
+    #[serde(default)]
+    tc_token: String,
+    #[serde(default)]
+    abs_token: String,
 }
 
 fn default_add_version() -> i32 {
@@ -1100,14 +1176,32 @@ async fn api_add_lap(
     let Ok(mut tx) = state.pool.begin().await else {
         return api_res(false, "数据库连接失败");
     };
+    let assist = {
+        let (pedal, tcm, tcs, absm, abss) =
+            crate::api::laps::tokens_to_raw(&f.pedal_token, &f.tc_token, &f.abs_token);
+        crate::score::AssistConfig {
+            pedal_mode: pedal,
+            tc_mode: tcm,
+            tc_strength: tcs,
+            abs_mode: absm,
+            abs_strength: abss,
+        }
+    };
     sqlx::query(
-        "INSERT INTO laps (id, user_id, gp_index, version_code, lap_ms) VALUES ($1,$2,$3,$4,$5)",
+        "INSERT INTO laps (id, user_id, gp_index, version_code, lap_ms, \
+                           pedal_mode, tc_mode, tc_strength, abs_mode, abs_strength) \
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)",
     )
     .bind(Uuid::now_v7())
     .bind(user_id)
     .bind(f.gp_index)
     .bind(f.version_code) // 管理端补录按所选版本记账（默认 8.0.6）
     .bind(lap_ms)
+    .bind(&assist.pedal_mode)
+    .bind(&assist.tc_mode)
+    .bind(&assist.tc_strength)
+    .bind(&assist.abs_mode)
+    .bind(&assist.abs_strength)
     .execute(&mut *tx)
     .await
     .map(|r| r.rows_affected())
@@ -1173,8 +1267,18 @@ async fn recalc_delete(pool: &PgPool, lap_id: Uuid, admin: &str) -> anyhow::Resu
     Ok(Some((gp, ver, before_alltime, before_version)))
 }
 
-/// 编辑圈速（改 lap_ms）后重算同维度。返回 Some((gp, version)) 表示目标存在且已改。
-async fn recalc_edit(pool: &PgPool, lap_id: Uuid, new_ms: i32, admin: &str) -> anyhow::Result<Option<(i16, i32)>> {
+/// 编辑圈速（改 lap_ms）**或**辅助配置（补填使用情况）后重算同维度。
+///
+/// 配置五维与圈速一起写：管理员编辑历史记录时既要改时间、也要补配置，
+/// 两个表单在同一弹窗里提交。配置留空 = 缺失（不改分）。
+/// 返回 Some((gp, version)) 表示目标存在且已改。
+async fn recalc_edit(
+    pool: &PgPool,
+    lap_id: Uuid,
+    new_ms: i32,
+    assist: &crate::score::AssistConfig,
+    admin: &str,
+) -> anyhow::Result<Option<(i16, i32)>> {
     let mut tx = pool.begin().await?;
     let target: Option<(Uuid, i16, i32)> =
         sqlx::query_as("SELECT user_id, gp_index, version_code FROM laps WHERE id=$1")
@@ -1188,11 +1292,19 @@ async fn recalc_edit(pool: &PgPool, lap_id: Uuid, new_ms: i32, admin: &str) -> a
     if new_ms <= 0 || new_ms > 3_600_000 {
         return Ok(None);
     }
-    sqlx::query("UPDATE laps SET lap_ms=$2 WHERE id=$1")
-        .bind(lap_id)
-        .bind(new_ms)
-        .execute(&mut *tx)
-        .await?;
+    sqlx::query(
+        "UPDATE laps SET lap_ms=$2, pedal_mode=$3, tc_mode=$4, tc_strength=$5, \
+                         abs_mode=$6, abs_strength=$7 WHERE id=$1",
+    )
+    .bind(lap_id)
+    .bind(new_ms)
+    .bind(&assist.pedal_mode)
+    .bind(&assist.tc_mode)
+    .bind(&assist.tc_strength)
+    .bind(&assist.abs_mode)
+    .bind(&assist.abs_strength)
+    .execute(&mut *tx)
+    .await?;
     recalc_dims(&mut tx, uid, gp, ver).await?;
     sqlx::query("DELETE FROM admin_sessions WHERE expires_at < now()")
         .execute(&mut *tx)
@@ -1200,8 +1312,19 @@ async fn recalc_edit(pool: &PgPool, lap_id: Uuid, new_ms: i32, admin: &str) -> a
         .ok();
     crate::applog::log_event_tx(
         &mut tx, "info", "admin", "edit_lap", admin,
-        format!("修改成绩圈速 → {}（赛道 {gp} · 版本 {ver}，纪录已重算）", crate::api::leaderboard::format_lap_ms(new_ms)),
-        json!({"lap_id": lap_id.to_string(), "new_ms": new_ms}),
+        format!(
+            "修改成绩 → {}（赛道 {gp} · 版本 {ver}，配置 {} · {} · {}，纪录已重算）",
+            crate::api::leaderboard::format_lap_ms(new_ms),
+            assist.pedal_mode.as_deref().unwrap_or("缺失"),
+            assist.tc_mode.as_deref().unwrap_or("缺失"),
+            assist.abs_mode.as_deref().unwrap_or("缺失"),
+        ),
+        json!({
+            "lap_id": lap_id.to_string(), "new_ms": new_ms,
+            "pedal_mode": assist.pedal_mode, "tc_mode": assist.tc_mode,
+            "tc_strength": assist.tc_strength, "abs_mode": assist.abs_mode,
+            "abs_strength": assist.abs_strength,
+        }),
     )
     .await;
     tx.commit().await?;
@@ -1209,30 +1332,58 @@ async fn recalc_edit(pool: &PgPool, lap_id: Uuid, new_ms: i32, admin: &str) -> a
 }
 
 /// 重算 (user, gp, version) 维度的 best_laps + 全服 records（持有者=最快圈主人）。
+///
+/// ️ best_laps 的四个配置派生位必须**从 laps 全量留档回放**（取获胜那条圈的
+/// 配置）：管理端删除/编辑成绩后只重算圈速而漏掉配置，会让榜单挂着已被删除那条
+/// 圈的辅助标识——金标与加成都算错。DISTINCT ON 取最快圈时顺带把五维配置带出来。
 async fn recalc_dims(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     uid: Uuid,
     gp: i16,
     ver: i32,
 ) -> anyhow::Result<()> {
-    // 重算 best_laps
-    let ub: Option<i32> = sqlx::query_scalar(
-        "SELECT min(lap_ms) FROM laps WHERE user_id=$1 AND gp_index=$2 AND version_code=$3",
-    )
-    .bind(uid)
-    .bind(gp)
-    .bind(ver)
-    .fetch_one(&mut **tx)
-    .await?;
+    // 重算 best_laps：最快圈的圈速 + 该圈的辅助配置（同一行取出，保证同源）
+    let ub: Option<(i32, Option<String>, Option<String>, Option<String>, Option<String>, Option<String>)> =
+        sqlx::query_as(
+            "SELECT lap_ms, pedal_mode, tc_mode, tc_strength, abs_mode, abs_strength \
+             FROM laps WHERE user_id=$1 AND gp_index=$2 AND version_code=$3 \
+             ORDER BY lap_ms ASC, created_at ASC LIMIT 1",
+        )
+        .bind(uid)
+        .bind(gp)
+        .bind(ver)
+        .fetch_optional(&mut **tx)
+        .await?;
     match ub {
-        Some(ms) => {
+        Some((ms, pedal, tcm, tcs, absm, abss)) => {
+            let f = crate::api::laps::flags_of(
+                pedal.as_deref(),
+                tcm.as_deref(),
+                tcs.as_deref(),
+                absm.as_deref(),
+                abss.as_deref(),
+            );
             // upsert：best_laps 缺行（管理端补录新维度首圈/编辑后新维度）也能补插——
             // 原 UPDATE-only 写法对不存在的行静默 0 行，导致 laps 有圈而 best_laps/榜单无成绩
             sqlx::query(
-                "INSERT INTO best_laps (user_id, gp_index, version_code, lap_ms) VALUES ($1,$2,$3,$4) \
+                "INSERT INTO best_laps (user_id, gp_index, version_code, lap_ms, \
+                                        pedal_linear, tc_off, abs_off, abs_low) \
+                 VALUES ($1,$2,$3,$4,$5,$6,$7,$8) \
                  ON CONFLICT (user_id, gp_index, version_code) \
-                 DO UPDATE SET lap_ms=EXCLUDED.lap_ms, updated_at=now()",
-            ).bind(uid).bind(gp).bind(ver).bind(ms).execute(&mut **tx).await?;
+                 DO UPDATE SET lap_ms=EXCLUDED.lap_ms, updated_at=now(), \
+                               pedal_linear=EXCLUDED.pedal_linear, tc_off=EXCLUDED.tc_off, \
+                               abs_off=EXCLUDED.abs_off, abs_low=EXCLUDED.abs_low",
+            )
+            .bind(uid)
+            .bind(gp)
+            .bind(ver)
+            .bind(ms)
+            .bind(f.pedal_linear)
+            .bind(f.tc_off)
+            .bind(f.abs_off)
+            .bind(f.abs_low)
+            .execute(&mut **tx)
+            .await?;
         }
         None => {
             sqlx::query(
