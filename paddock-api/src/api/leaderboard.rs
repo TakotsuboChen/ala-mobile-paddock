@@ -1,8 +1,21 @@
 //! 排行榜查询：积分总榜/版本榜 + 赛道榜。
-//! 积分公式（v39 定案）：score = round((N−rank)×100/N)，第一 100、每名次递减 100/N、虚位第 N+1 名 0 分；N=1 → 100。
-//! 总榜跨版本累加：对用户在所有版本 best_laps 的每赛道最佳名次积分求和
-//! （同赛道多版本取该用户跨版本的最好成绩参与版本排名——定案口径：版本榜看该版本，
-//! 总榜看"每个用户在该赛道的绝对最佳"，以 best of best 参与总榜排名）。
+//!
+//! ## 积分公式（v40 基础分 + 2026-09-18 辅助加成）
+//!
+//! `total = base + bonus`，其中 base/bonus 的定义与 SQL 片段**全部**在
+//! [`crate::score`]（单一事实源）。本文件只负责窗口分区与聚合：
+//! - 版本榜：`PARTITION BY gp_index`（该版本内每赛道独立排名）
+//! - 总榜：`PARTITION BY version_code, gp_index`——**版本 = 独立赛季**，
+//!   同一用户在 8.0.4 与 8.0.6 各拿全赛道第一 = 每赛道两笔满分，累加（不跨版本取最快）。
+//!
+//! ## 零辅助金标（2026-09-18 定案）
+//!
+//! 判据用**比值**而非绝对数，故新旧版本记录并存时口径自洽：
+//!   版本榜：`2 × 零辅助最快圈数 ≥ 最快圈总数`
+//!   总　榜：上式 **且** 零辅助最快圈数 > 0
+//! 分母是该版本（或全部版本）内有成绩的赛道数，不是"全服所有记录"——
+//! 即"个人最快圈里有多少比例是零辅助"。总榜与版本榜的金标互不蕴含
+//! （单版本可 100% 零辅助而总榜被老版本记录拉到 50% 以下）。
 
 use axum::{
     Json, Router,
@@ -12,7 +25,7 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::{api::auth_handlers::ApiError, api::laps::track_display_name, state::AppState};
+use crate::{api::auth_handlers::ApiError, api::laps::track_display_name, score, state::AppState};
 
 #[derive(Deserialize)]
 pub struct VersionFilter {
@@ -26,6 +39,12 @@ pub struct PointsEntry {
     pub username: String,
     pub avatar_url: Option<String>,
     pub points: i64,
+    /// 该用户在该榜维度内有成绩的赛道数（金标分母，客户端可用于展示"x/y"）
+    pub best_count: i64,
+    /// 其中零辅助最快圈的条数（金标分子）
+    pub zero_count: i64,
+    /// 是否显示金色流光（服务端判定的唯一事实源，客户端不重算）
+    pub gold: bool,
 }
 
 #[derive(Serialize)]
@@ -40,78 +59,55 @@ pub async fn points_board(
     State(state): State<AppState>,
     Query(f): Query<VersionFilter>,
 ) -> Result<Json<PointsBoard>, ApiError> {
-    let entries: Vec<PointsEntry> = match f.version {
-        Some(v) => {
-            // 版本榜：每用户在该版本内每赛道积分求和
-            sqlx::query_as::<_, PointsEntry>(
-                r#"WITH per_track AS (
-                     SELECT user_id,
-                            gp_index,
-                            lap_ms,
-                            rank() OVER (PARTITION BY gp_index ORDER BY lap_ms ASC) AS rank_in_track,
-                            count(*) OVER (PARTITION BY gp_index) AS n_in_track
-                     FROM best_laps WHERE version_code = $1
-                   )
-                   SELECT u.id AS user_id, u.reg_seq AS reg_seq, u.username AS username,
-                          (CASE WHEN u.avatar_key IS NOT NULL THEN '/v1/avatar/'||u.id||'?v='||COALESCE(u.avatar_version,0) END) AS avatar_url,
-                          (CASE WHEN n_in_track = 1 THEN 100
-                                ELSE round((n_in_track + 1 - rank_in_track)::numeric * 100 / n_in_track)
-                           END)::bigint AS points
-                   FROM per_track p JOIN users u ON u.id = p.user_id"#,
-            )
-            .bind(v)
-            .fetch_all(&state.pool)
-            .await
-            ?
-            .into_iter()
-            // 聚合到用户级
-            .fold(std::collections::HashMap::<Uuid, PointsEntry>::new(), |mut m, e| {
-                let entry = m.entry(e.user_id).or_insert(PointsEntry {
-                    user_id: e.user_id, reg_seq: e.reg_seq, username: e.username.clone(), avatar_url: e.avatar_url.clone(), points: 0,
-                });
-                entry.points += e.points;
-                m
-            })
-            .into_values()
-            .collect()
-        }
-        None => {
-            // 总榜（语义定案 2026-09-04）：每个游戏版本是独立赛季——同一用户在
-            // 8.0.4 和 8.0.6 各拿全赛道第一 = 1600+1600 = 3200 分。积分按
-            // (user, version, track) 维度独立计算后按用户累加，不跨版本取最快。
-            sqlx::query_as::<_, PointsEntry>(
-                r#"WITH per_track AS (
-                     SELECT user_id,
-                            gp_index,
-                            version_code,
-                            lap_ms,
-                            rank() OVER (PARTITION BY version_code, gp_index ORDER BY lap_ms ASC) AS rank_in_track,
-                            count(*) OVER (PARTITION BY version_code, gp_index) AS n_in_track
-                     FROM best_laps
-                   )
-                   SELECT u.id AS user_id, u.reg_seq AS reg_seq, u.username AS username,
-                          (CASE WHEN u.avatar_key IS NOT NULL THEN '/v1/avatar/'||u.id||'?v='||COALESCE(u.avatar_version,0) END) AS avatar_url,
-                          (CASE WHEN n_in_track = 1 THEN 100
-                                ELSE round((n_in_track + 1 - rank_in_track)::numeric * 100 / n_in_track)
-                           END)::bigint AS points
-                   FROM per_track p JOIN users u ON u.id = p.user_id"#,
-            )
-            .fetch_all(&state.pool)
-            .await
-            ?
-            .into_iter()
-            .fold(std::collections::HashMap::<Uuid, PointsEntry>::new(), |mut m, e| {
-                let entry = m.entry(e.user_id).or_insert(PointsEntry {
-                    user_id: e.user_id, reg_seq: e.reg_seq, username: e.username.clone(), avatar_url: e.avatar_url.clone(), points: 0,
-                });
-                entry.points += e.points;
-                m
-            })
-            .into_values()
-            .collect()
-        }
+    // 两个榜只差窗口分区与金标的存在性条件，其余 SQL 由 score 模块的片段拼出。
+    let (partition, gold_expr) = match f.version {
+        Some(_) => ("bl.gp_index", "2 * count(*) FILTER (WHERE s.tc_off AND s.abs_off) >= count(*)"),
+        None => (
+            "bl.version_code, bl.gp_index",
+            "count(*) FILTER (WHERE s.tc_off AND s.abs_off) > 0 \
+             AND 2 * count(*) FILTER (WHERE s.tc_off AND s.abs_off) >= count(*)",
+        ),
     };
-    let mut entries = entries;
+    let base = score::base_sql("rank_in_track", "n_in_track");
+    let bonus = score::bonus_sql("s.base_pts", "s");
+
+    // 层级说明：Postgres 不允许在同一 SELECT 列表里引用窗口函数别名，
+    // 也不允许引用同层的普通别名 → 窗口(ranked) → 基础分(scored) → 加成(最外层) 三层。
+    // ⚠️ `scored` 必须把 bonus 用到的**全部四个派生位列**一起带下来（pedal_linear /
+    //    tc_off / abs_off / abs_low）——漏一个就是运行期 `column s.x does not exist`
+    //    500 错误。Rust 侧 bonus_points() 读的是结构体字段（天然齐全），
+    //    单元测试发现不了这类"SQL 管线漏列"，只有真库能测（见 score_sql_tests.rs）。
+    let sql = format!(
+        "WITH ranked AS ( \
+           SELECT bl.user_id, bl.tc_off, bl.abs_off, bl.pedal_linear, bl.abs_low, \
+                  rank() OVER (PARTITION BY {partition} ORDER BY bl.lap_ms ASC) AS rank_in_track, \
+                  count(*) OVER (PARTITION BY {partition}) AS n_in_track \
+           FROM best_laps bl {version_filter} \
+         ), \
+         scored AS ( \
+           SELECT user_id, tc_off, abs_off, pedal_linear, abs_low, {base} AS base_pts FROM ranked \
+         ) \
+         SELECT u.id AS user_id, u.reg_seq AS reg_seq, u.username AS username, \
+                (CASE WHEN u.avatar_key IS NOT NULL \
+                      THEN '/v1/avatar/'||u.id||'?v='||COALESCE(u.avatar_version,0) END) AS avatar_url, \
+                sum(s.base_pts + {bonus})::bigint AS points, \
+                count(*)::bigint AS best_count, \
+                count(*) FILTER (WHERE s.tc_off AND s.abs_off)::bigint AS zero_count, \
+                ({gold_expr}) AS gold \
+         FROM scored s JOIN users u ON u.id = s.user_id \
+         GROUP BY u.id, u.reg_seq, u.username, u.avatar_key, u.avatar_version",
+        version_filter = f
+            .version
+            .map(|_| "WHERE bl.version_code = $1".to_string())
+            .unwrap_or_default(),
+    );
+
+    let mut q = sqlx::query_as::<_, PointsEntry>(&sql);
+    if let Some(v) = f.version {
+        q = q.bind(v);
+    }
+    let mut entries = q.fetch_all(&state.pool).await?;
+
     entries.sort_by(|a, b| {
         b.points
             .cmp(&a.points)
@@ -135,6 +131,9 @@ pub struct TrackEntry {
     pub lap_ms: i32,
     /// 服务端格式化的圈时（mm:ss.mmm）
     pub lap_display: String,
+    /// 该车手的个人最快圈是否为零辅助（TC 与 ABS 均关）→ 整行金色流光。
+    /// 判据只含 TC/ABS，不含踏板——用户定案：原生按键物理上跑不出有效圈。
+    pub gold: bool,
 }
 
 #[derive(Serialize)]
@@ -154,40 +153,47 @@ pub async fn track_board(
     if !(0..16).contains(&gp_index) {
         return Err(ApiError::bad_request("gp_index 越界（0..15）"));
     }
-    let rows: Vec<(Uuid, i64, String, Option<String>, i32)> = match f.version {
-        Some(v) => sqlx::query_as(
-            "SELECT b.user_id, u.reg_seq, u.username, (CASE WHEN u.avatar_key IS NOT NULL THEN '/v1/avatar/'||u.id||'?v='||COALESCE(u.avatar_version,0) END), b.lap_ms FROM best_laps b JOIN users u ON u.id=b.user_id \
-             WHERE b.gp_index=$1 AND b.version_code=$2 ORDER BY b.lap_ms ASC",
-        )
-        .bind(gp_index)
-        .bind(v)
-        .fetch_all(&state.pool)
-        .await
-        ?,
-        None => {
-            sqlx::query_as(
-                "SELECT ub.user_id, u.reg_seq, u.username, (CASE WHEN u.avatar_key IS NOT NULL THEN '/v1/avatar/'||u.id||'?v='||COALESCE(u.avatar_version,0) END), ub.lap_ms FROM \
-                 (SELECT user_id, min(lap_ms) AS lap_ms FROM best_laps WHERE gp_index=$1 GROUP BY user_id) ub \
-                 JOIN users u ON u.id=ub.user_id ORDER BY ub.lap_ms ASC",
-            )
-            .bind(gp_index)
-            .fetch_all(&state.pool)
-            .await
-            ?
-        }
+    // 两分支都取"该用户在该赛道的最佳圈"及其配置：显式版本按版本过滤；
+    // 无版本 = 跨版本 best of best（DISTINCT ON 取最快那条，与 min() 语义等价
+    // 但能同时带回该圈的配置列）。外层再按圈速排序定名次。
+    let avatar = "(CASE WHEN u.avatar_key IS NOT NULL \
+                  THEN '/v1/avatar/'||u.id||'?v='||COALESCE(u.avatar_version,0) END)";
+    let inner_where = match f.version {
+        Some(_) => "b.gp_index=$1 AND b.version_code=$2",
+        None => "b.gp_index=$1",
     };
+    let sql = format!(
+        "SELECT user_id, reg_seq, username, avatar_url, lap_ms, (tc_off AND abs_off) AS gold \
+         FROM ( \
+           SELECT DISTINCT ON (b.user_id) b.user_id, u.reg_seq, u.username, {avatar} AS avatar_url, \
+                  b.lap_ms, b.tc_off, b.abs_off \
+           FROM best_laps b JOIN users u ON u.id = b.user_id \
+           WHERE {inner_where} \
+           ORDER BY b.user_id, b.lap_ms ASC \
+         ) t ORDER BY lap_ms ASC"
+    );
+    let mut q = sqlx::query_as::<_, (Uuid, i64, String, Option<String>, i32, bool)>(&sql);
+    q = q.bind(gp_index);
+    if let Some(v) = f.version {
+        q = q.bind(v);
+    }
+    let rows = q.fetch_all(&state.pool).await?;
+
     let entries = rows
         .into_iter()
         .enumerate()
-        .map(|(i, (user_id, reg_seq, username, avatar_url, lap_ms))| TrackEntry {
-            rank: (i + 1) as i64,
-            user_id,
-            reg_seq,
-            username,
-            avatar_url,
-            lap_ms,
-            lap_display: format_lap_ms(lap_ms),
-        })
+        .map(
+            |(i, (user_id, reg_seq, username, avatar_url, lap_ms, gold))| TrackEntry {
+                rank: (i + 1) as i64,
+                user_id,
+                reg_seq,
+                username,
+                avatar_url,
+                lap_ms,
+                lap_display: format_lap_ms(lap_ms),
+                gold,
+            },
+        )
         .collect();
     Ok(Json(TrackBoard {
         gp_index,

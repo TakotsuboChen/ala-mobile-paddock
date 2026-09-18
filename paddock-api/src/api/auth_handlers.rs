@@ -17,7 +17,7 @@ use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
 use uuid::Uuid;
 
-use crate::{auth, state::AppState};
+use crate::{auth, score, state::AppState};
 
 #[derive(Deserialize)]
 pub struct RegisterRequest {
@@ -321,24 +321,31 @@ pub async fn me(
     } else {
         None
     };
-    // 积分口径与 leaderboard::points_board 总榜分支一致（版本=独立赛季累加 + v40 线性公式）。
+    // 积分口径与 leaderboard::points_board 总榜分支一致（版本=独立赛季累加 +
+    // v40 线性基础分 + 2026-09-18 辅助加成）。**基础分与加成两段 SQL 都由
+    // [`crate::score`] 生成**——本查询与榜单是两处独立实现，任何公式改动
+    // 只要走 score 模块就自动同步，不会像旧版那样"四处照抄字符串"。
     // ⚠️ 窗口函数必须基于全量 best_laps 计算再过滤用户——若把 WHERE user_id 放进
     // per_track CTE，n_in_track 恒为 1，每人每赛道都走 100 分特判，与总榜口径脱节。
-    let total_points: i64 = sqlx::query_scalar(
+    let base_expr = score::base_sql("rank_in_track", "n_in_track");
+    let score_sql = format!(
         r#"WITH per_track AS (
              SELECT user_id, version_code, gp_index, lap_ms,
                     rank() OVER (PARTITION BY version_code, gp_index ORDER BY lap_ms ASC) AS rank_in_track,
-                    count(*) OVER (PARTITION BY version_code, gp_index) AS n_in_track
+                    count(*) OVER (PARTITION BY version_code, gp_index) AS n_in_track,
+                    pedal_linear, tc_off, abs_off, abs_low
              FROM best_laps
+           ), scored AS (
+             SELECT user_id, {base_expr} AS base_pts, pedal_linear, tc_off, abs_off, abs_low
+             FROM per_track
            )
-           SELECT coalesce(sum(CASE WHEN n_in_track = 1 THEN 100
-                                    ELSE round((n_in_track + 1 - rank_in_track)::numeric * 100 / n_in_track)
-                               END), 0)::bigint
-           FROM per_track WHERE user_id = $1"#,
-    )
-    .bind(user_id)
-    .fetch_one(&state.pool)
-    .await?;
+           SELECT coalesce(sum(base_pts + {bonus}), 0)::bigint FROM scored WHERE user_id = $1"#,
+        bonus = score::bonus_sql("base_pts", "scored"),
+    );
+    let total_points: i64 = sqlx::query_scalar(&score_sql)
+        .bind(user_id)
+        .fetch_one(&state.pool)
+        .await?;
     Ok(Json(MeResp {
         user_id,
         username,

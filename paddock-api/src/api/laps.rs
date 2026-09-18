@@ -2,21 +2,35 @@
 //! 事务内：写入 laps 全量留档 → upsert best_laps → 与 records 比对判定 Toast → 更新 records。
 //! Toast 四条件取最高（定案）：全服历史 > 全服版本 > 个人历史 > 个人版本。
 //! 防伪定案=全放行：无物理阈值拒收，仅登录态门槛 + 管理端事后删。
+//!
+//! ## 辅助配置（2026-09-18）
+//!
+//! 上报体附带**原始配置枚举**（`AssistConfig`），由服务端派生四个布尔位存进
+//! best_laps——客户端只报事实，加减分规则留在服务端（改规则不必发模块版本）。
+//! 缺失 = 全部 Option 为 None（旧模块不传字段 → serde 落到 `Default`），
+//! 派生位全 false = 不加分，与"缺失"语义一致。
+//!
+//! ️ 配置随**圈**走：best_laps 存的是"拿分的**那条圈**的配置"。玩家换配置后
+//! 跑得更快 → upsert 时配置一并刷新；跑更慢 → 配置不动（榜上仍是旧那条圈的配置）。
 
 use axum::{Json, Router, extract::State, http::HeaderMap, routing::post};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::{api::auth_handlers::ApiError, auth, state::AppState};
+use crate::{api::auth_handlers::ApiError, auth, score, state::AppState};
 
 #[derive(Deserialize)]
 pub struct LapUpload {
     /// 0..15（buildIndex − 2，见 TRACK_IDENTIFICATION.md）
     pub gp_index: i16,
-    /// 游戏 6 位 versionCode（200146 = 8.0.4）
+    /// 游戏 6 位 versionCode（200150 = 8.0.6）
     pub version_code: i32,
     /// 完整圈时（毫秒）。调用方须只对有效圈上报（模块侧 lap_hook validLap 位过滤）。
     pub lap_ms: i32,
+    /// 辅助配置五维原始枚举（缺失 = None）。`#[serde(flatten)]` 让旧客户端
+    /// （只发三个字段）与不确定字段的新客户端都能通过反序列化。
+    #[serde(flatten)]
+    pub assist: score::AssistConfig,
 }
 
 #[derive(Serialize)]
@@ -51,21 +65,35 @@ pub async fn upload_lap(
 
     let mut tx = state.pool.begin().await?;
 
+    // 配置归一化：未知枚举值落"缺失"而非报错（前向兼容 + 数据面白名单）。
+    let assist = lap.assist.normalized();
+    let flags = score::AssistFlags::from(&assist);
+
     // 1) 全量留档
     sqlx::query(
-        "INSERT INTO laps (id, user_id, gp_index, version_code, lap_ms) VALUES ($1,$2,$3,$4,$5)",
+        "INSERT INTO laps (id, user_id, gp_index, version_code, lap_ms, \
+                           pedal_mode, tc_mode, tc_strength, abs_mode, abs_strength) \
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)",
     )
     .bind(Uuid::now_v7())
     .bind(user_id)
     .bind(lap.gp_index)
     .bind(lap.version_code)
     .bind(lap.lap_ms)
+    .bind(&assist.pedal_mode)
+    .bind(&assist.tc_mode)
+    .bind(&assist.tc_strength)
+    .bind(&assist.abs_mode)
+    .bind(&assist.abs_strength)
     .execute(&mut *tx)
     .await?;
 
     // 2) 个人版本最佳（best_laps：每人每赛道每版本一条）
+    //    ⚠️ 配置列必须与 lap_ms 同期更新——否则"刷新个人纪录"后榜上挂着
+    //    上一条圈的旧配置，金标与加成都算错。两者同属"这条圈的事实"。
     let prev_personal: Option<i32> = sqlx::query_scalar(
-        "UPDATE best_laps SET lap_ms = $4, updated_at = now() \
+        "UPDATE best_laps SET lap_ms = $4, updated_at = now(), \
+                pedal_linear = $5, tc_off = $6, abs_off = $7, abs_low = $8 \
          WHERE user_id=$1 AND gp_index=$2 AND version_code=$3 AND lap_ms > $4 \
          RETURNING (SELECT lap_ms FROM best_laps WHERE user_id=$1 AND gp_index=$2 AND version_code=$3 AND lap_ms > $4)",
     )
@@ -73,6 +101,10 @@ pub async fn upload_lap(
     .bind(lap.gp_index)
     .bind(lap.version_code)
     .bind(lap.lap_ms)
+    .bind(flags.pedal_linear)
+    .bind(flags.tc_off)
+    .bind(flags.abs_off)
+    .bind(flags.abs_low)
     .fetch_optional(&mut *tx)
     .await
     ?
@@ -94,15 +126,24 @@ pub async fn upload_lap(
                 Some(better) if better <= lap.lap_ms => Some(better), // 未破个人版本纪录
                 _ => {
                     sqlx::query(
-                        "INSERT INTO best_laps (user_id, gp_index, version_code, lap_ms) \
-                         VALUES ($1,$2,$3,$4) \
+                        "INSERT INTO best_laps (user_id, gp_index, version_code, lap_ms, \
+                                                pedal_linear, tc_off, abs_off, abs_low) \
+                         VALUES ($1,$2,$3,$4,$5,$6,$7,$8) \
                          ON CONFLICT (user_id, gp_index, version_code) \
-                         DO UPDATE SET lap_ms = EXCLUDED.lap_ms, updated_at = now()",
+                         DO UPDATE SET lap_ms = EXCLUDED.lap_ms, updated_at = now(), \
+                                       pedal_linear = EXCLUDED.pedal_linear, \
+                                       tc_off = EXCLUDED.tc_off, \
+                                       abs_off = EXCLUDED.abs_off, \
+                                       abs_low = EXCLUDED.abs_low",
                     )
                     .bind(user_id)
                     .bind(lap.gp_index)
                     .bind(lap.version_code)
                     .bind(lap.lap_ms)
+                    .bind(flags.pedal_linear)
+                    .bind(flags.tc_off)
+                    .bind(flags.abs_off)
+                    .bind(flags.abs_low)
                     .execute(&mut *tx)
                     .await?;
                     None // 新纪录或首次，无"前值"
@@ -301,6 +342,131 @@ pub fn version_display(version_code: i32) -> String {
         200146 => "8.0.4".to_string(),
         other => format!("code {other}"),
     }
+}
+
+/// `laps` 配置五维（管理端"配置"列与模块回读共用）→ 与 [`crate::score::AssistFlags`] 同规则。
+pub fn flags_of(
+    pedal_mode: Option<&str>,
+    tc_mode: Option<&str>,
+    tc_strength: Option<&str>,
+    abs_mode: Option<&str>,
+    abs_strength: Option<&str>,
+) -> score::AssistFlags {
+    let cfg = score::AssistConfig {
+        pedal_mode: pedal_mode.map(str::to_string),
+        tc_mode: tc_mode.map(str::to_string),
+        tc_strength: tc_strength.map(str::to_string),
+        abs_mode: abs_mode.map(str::to_string),
+        abs_strength: abs_strength.map(str::to_string),
+    };
+    score::AssistFlags::from(&cfg)
+}
+
+/// 踏板档位 token → 展示名（管理端下拉与"配置"列共用同一张表）。
+pub const PEDAL_TOKENS: [(&str, &str); 3] =
+    [("off", "原生按键"), ("single", "单踏板"), ("dual", "双踏板")];
+
+/// TC/ABS 档位 token → 展示名。`stock` = 最高档，也代表"未开自定义（游戏默认）"。
+pub const STRENGTH_TOKENS: [(&str, &str); 5] = [
+    ("off", "关"),
+    ("weak", "低"),
+    ("medium", "中"),
+    ("strong", "高"),
+    ("stock", "最高"),
+];
+
+/// token → 展示名。**唯一查表入口**：`&str` 是 `'static`，返回的 `&'static str`
+/// 来自常量表，不借用入参生命周期（写成 `&[(&str,&str)]` 会被 elided lifetime
+/// 绑到入参上而报 E0311 一类错误）。
+pub fn token_label(tokens: &'static [(&'static str, &'static str)], token: &str) -> &'static str {
+    if token.is_empty() {
+        return "缺失";
+    }
+    tokens
+        .iter()
+        .find(|(k, _)| *k == token)
+        .map(|(_, d)| *d)
+        .unwrap_or("缺失")
+}
+
+/// TC/ABS 的**模式 + 档位合并成单一 token**——这是管理端展示与编辑的粒度。
+///
+/// 为什么合并：`mode=default`（游戏默认透传）与 `mode=custom + strength=stock`
+/// 在**计分上完全等价**（都不加分），用户诉求也是"默认就是最高"。分两维展示
+/// 只会让"配置"列多出一列没人看的"默认/自定义"，纯占地方。
+///
+/// 数据面仍存原始两维（`laps.tc_mode` / `tc_strength`）——合并只发生在展示层。
+fn collapse_mode(mode: Option<&str>, strength: Option<&str>) -> String {
+    match mode {
+        None => String::new(),                        // 缺失
+        Some("default") => "stock".to_string(),       // 默认 ≡ 最高
+        Some(_) => strength.unwrap_or("").to_string(), // custom → 用真实档位
+    }
+}
+
+/// 辅助配置 → 三个 token（踏板 / TC / ABS），`""` = 缺失。
+///
+/// 这是管理端"配置"列与编辑下拉的**同一份数据源**：下拉的 option value 就是
+/// token，展示名由 [`token_label`] 查表，读写两侧不会漂移。
+pub fn assist_tokens(
+    pedal_mode: Option<&str>,
+    tc_mode: Option<&str>,
+    tc_strength: Option<&str>,
+    abs_mode: Option<&str>,
+    abs_strength: Option<&str>,
+) -> (String, String, String) {
+    (
+        pedal_mode.unwrap_or("").to_string(),
+        collapse_mode(tc_mode, tc_strength),
+        collapse_mode(abs_mode, abs_strength),
+    )
+}
+
+/// 辅助配置 → 展示三元组（`"双踏板" / "关" / "最高"` 的逐维读数）。
+pub fn assist_display(
+    pedal_mode: Option<&str>,
+    tc_mode: Option<&str>,
+    tc_strength: Option<&str>,
+    abs_mode: Option<&str>,
+    abs_strength: Option<&str>,
+) -> (String, String, String) {
+    let (p, tc, abs) = assist_tokens(pedal_mode, tc_mode, tc_strength, abs_mode, abs_strength);
+    (
+        token_label(&PEDAL_TOKENS, &p).to_string(),
+        token_label(&STRENGTH_TOKENS, &tc).to_string(),
+        token_label(&STRENGTH_TOKENS, &abs).to_string(),
+    )
+}
+
+/// 三个 token → `(pedal_mode, tc_mode, tc_strength, abs_mode, abs_strength)` 原始五维。
+///
+/// 编辑弹窗提交的 token 经此展开回数据库列。`""`（缺失）= 该维两列都 NULL；
+/// `"stock"` = `mode=default`（**游戏默认**，而非"开自定义选了最高"——后者在
+/// 计分上等价但与用户语义不符：管理员选"最高"的意思是"这圈没调低辅助"）。
+pub fn tokens_to_raw(
+    pedal: &str,
+    tc: &str,
+    abs: &str,
+) -> (
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+) {
+    let pedal_raw = if pedal.is_empty() { None } else { Some(pedal.to_string()) };
+    let expand = |t: &str| -> (Option<String>, Option<String>) {
+        if t.is_empty() {
+            (None, None)
+        } else if t == "stock" {
+            (Some("default".to_string()), Some("stock".to_string()))
+        } else {
+            (Some("custom".to_string()), Some(t.to_string()))
+        }
+    };
+    let (tcm, tcs) = expand(tc);
+    let (absm, abss) = expand(abs);
+    (pedal_raw, tcm, tcs, absm, abss)
 }
 
 /// 赛道中文名，带国旗前缀（契约源头=PADDOCK_PLAN.md §5；模块侧同名表保持一致，改必须两边同改）。

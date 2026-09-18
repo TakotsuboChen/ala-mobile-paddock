@@ -8,6 +8,12 @@ mod applog;
 mod auth;
 mod qq_bot;
 mod runlog;
+/// 积分公式 + 辅助配置派生的单一事实源（见模块头注释：五处 SQL 副本的同步契约）。
+mod score;
+/// 端到端 SQL 测试（`#[ignore]`，需 DATABASE_URL 指向真实 Postgres）。
+/// 只在 test 构建下编译——生产二进制不含测试代码。
+#[cfg(test)]
+mod score_sql_tests;
 mod state;
 
 use anyhow::Context;
@@ -44,6 +50,9 @@ async fn main() -> anyhow::Result<()> {
         .await
         .context("执行数据库迁移失败")?;
     applog::purge_expired(&pool).await; // 90 天保留：启动时清一次过期日志
+    // 一次性：为库里已有的内置播报规则补 gold_template（新字段，旧 JSON 里没有）。
+    // 用独立标记保证只跑一次——用户清空过金标模板后不会被静默填回。
+    qq_bot::migrate_gold_templates_once(&pool).await;
 
     // bot 发送队列：凭据由管理端设置页动态配置，worker 出队时实时读取，无需重启
     let (bot_tx, bot_rx) = tokio::sync::mpsc::channel(64);
