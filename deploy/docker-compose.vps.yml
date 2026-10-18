@@ -1,18 +1,32 @@
-# paddock docker-compose 部署（VPS 8.134.50.222 实机版，2026-08-31）
+# paddock docker-compose 部署（VPS 8.134.50.222 实机版，2026-08-31；2026-10-18 对齐实跑状态）
 # 与仓内原版的差异：无 Caddy（80/443 由宿主机 openresty/1Panel 占用，反代由用户在面板侧配置），
 # app 发布到 127.0.0.1:8080 供 openresty proxy_pass；garage 3900 仅内网。
 # 契约源：../ala-mobile-tool/docs/PADDOCK_PLAN.md
+#
+# ⚠️ **本文件必须与 VPS `~/paddock/docker-compose.vps.yml` 逐字一致**——它是灾难恢复的
+#    单一事实源，漂移不会报错，只会在重建时爆发。2026-10-18 实测漂移过一次：
+#    仓库版缺 `GARAGE_ENDPOINT/KEY_ID/SECRET` 三个变量，而 `paddock-api/src/api/avatar.rs`
+#    读不到它们会直接返回 None（日志：`GARAGE_KEY_ID/GARAGE_SECRET 未配置，头像功能不可用`）
+#    ⇒ 照仓库版重建 = 头像功能静默失效。
+#    核对手法：`ssh ... "cat ~/paddock/docker-compose.vps.yml" | diff - deploy/docker-compose.vps.yml`
+#    必须无输出。改动一律先在 VPS 上验证，再回写本文件。
 
 services:
   app:
-    image: paddock-api:1.0.1
+    # ⚠️ tag 与 VPS 实跑值一致（`docker ps --format '{{.Image}}'` 可核）。
+    #    `-paging` 后缀是分页功能批次的部署 tag，尚未提升为正式版本号。
+    image: paddock-api:1.0.1-paging
     restart: unless-stopped
     environment:
       DATABASE_URL: postgres://paddock:${POSTGRES_PASSWORD}@postgres:5432/paddock
       BIND_ADDR: 0.0.0.0:8080
-      RUST_LOG: paddock_api=info,tower_http=warn
+      RUST_LOG: paddock_api=debug,tower_http=info
       PADDOCK_ADMIN_USER: admin
       PADDOCK_ADMIN_PASS: ${PADDOCK_ADMIN_PASS}
+      # Garage（头像存储）凭据，由 .env 注入。缺任一项则头像功能不可用（见文件头注释）。
+      GARAGE_ENDPOINT: ${GARAGE_ENDPOINT:-http://garage:3900}
+      GARAGE_KEY_ID: ${GARAGE_KEY_ID:-}
+      GARAGE_SECRET: ${GARAGE_SECRET:-}
     ports:
       - "127.0.0.1:8080:8080"
     depends_on:
