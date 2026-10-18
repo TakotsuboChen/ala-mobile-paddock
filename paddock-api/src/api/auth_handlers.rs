@@ -327,6 +327,24 @@ pub async fn me(
     // 只要走 score 模块就自动同步，不会像旧版那样"四处照抄字符串"。
     // ⚠️ 窗口函数必须基于全量 best_laps 计算再过滤用户——若把 WHERE user_id 放进
     // per_track CTE，n_in_track 恒为 1，每人每赛道都走 100 分特判，与总榜口径脱节。
+    // 2026-10-18：抽成 [`total_points_of`]——车手主页也要显示同口径积分，
+    // 两份副本一旦漂移，用户会看到"主页积分 ≠ 榜单积分"。
+    let total_points = total_points_of(&state, user_id).await?;
+    Ok(Json(MeResp {
+        user_id,
+        username,
+        reg_seq,
+        has_avatar,
+        avatar_url,
+        total_points,
+    }))
+}
+
+/// 计时赛总积分（版本=独立赛季累加；`/v1/me` 与车手主页共用）。
+///
+/// **单一实现点**：公式两段 SQL 都来自 [`crate::score`]，窗口必须基于全量
+/// `best_laps` 再过滤用户（见调用点注释）。
+pub async fn total_points_of(state: &AppState, user_id: Uuid) -> Result<i64, ApiError> {
     let base_expr = score::base_sql("rank_in_track", "n_in_track");
     let score_sql = format!(
         r#"WITH per_track AS (
@@ -342,18 +360,10 @@ pub async fn me(
            SELECT coalesce(sum(base_pts + {bonus}), 0)::bigint FROM scored WHERE user_id = $1"#,
         bonus = score::bonus_sql("base_pts", "scored"),
     );
-    let total_points: i64 = sqlx::query_scalar(&score_sql)
+    Ok(sqlx::query_scalar(&score_sql)
         .bind(user_id)
         .fetch_one(&state.pool)
-        .await?;
-    Ok(Json(MeResp {
-        user_id,
-        username,
-        reg_seq,
-        has_avatar,
-        avatar_url,
-        total_points,
-    }))
+        .await?)
 }
 
 async fn user_exists(pool: &PgPool, username: &str) -> Result<bool, ApiError> {
