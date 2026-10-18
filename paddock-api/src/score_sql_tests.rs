@@ -308,6 +308,87 @@ async fn sql_track_board_picks_config_of_winning_lap() {
     assert_eq!(row2, (90_000, false), "版本榜只看该版本");
 }
 
+/// 分页（2026-10-18 新增）：`total` 必须与分页无关，且跨页不重复、不漏项。
+///
+/// ## 为什么这条测试必须存在
+///
+/// 分页有三个只有真库能暴露的错误，Rust 侧单元测试全绿也发现不了：
+/// ① **排序没下推到 SQL** —— 原实现 `sort_by` 后再切片，切的是未排序结果的
+///    前 N 条，跨页重复/漏项；
+/// ② **名次按页重排** —— 原赛道榜在 Rust 里 `enumerate()` 生成 rank，
+///    第二页从 1 重新编号；
+/// ③ **`count(*) OVER ()` 在空页拿不到值** —— offset 越界返回 0 行，
+///    客户端会把"没有更多了"误判成"这个榜是空的"。
+///
+/// 本用例复刻 handler 的分页外壳（`agg` + `count(*) OVER ()`），逐条断言。
+#[tokio::test]
+#[ignore]
+async fn sql_pagination_is_stable_and_total_is_page_independent() {
+    let Some(pool) = setup().await else { return };
+    wipe(&pool).await;
+    // 5 个用户，同赛道同版本，圈速递增（名次可预测：u1 最快）
+    let mut ids = Vec::new();
+    for i in 0..5i64 {
+        let u = mk_user(&pool, &format!("pager{i}"), i + 1).await;
+        ids.push(u);
+        mk_lap(
+            &pool, u, 3, 200150, 90_000 + (i as i32) * 1_000,
+            Some("off"), Some("default"), Some("stock"), Some("default"), Some("stock"),
+        ).await;
+    }
+
+    // 复刻 points_board 的分页外壳（排序下推 + total 窗口）
+    let base = score::base_sql("rank_in_track", "n_in_track");
+    let bonus = score::bonus_sql("s.base_pts", "s");
+    let sql = format!(
+        "WITH ranked AS ( \
+           SELECT bl.user_id, bl.tc_off, bl.abs_off, bl.pedal_linear, bl.abs_low, \
+                  rank() OVER (PARTITION BY bl.gp_index ORDER BY bl.lap_ms ASC) AS rank_in_track, \
+                  count(*) OVER (PARTITION BY bl.gp_index) AS n_in_track \
+           FROM best_laps bl WHERE bl.version_code = $1 \
+         ), scored AS ( \
+           SELECT user_id, tc_off, abs_off, pedal_linear, abs_low, {base} AS base_pts FROM ranked \
+         ), agg AS ( \
+           SELECT u.id AS user_id, u.username AS username, \
+                  sum(s.base_pts + {bonus})::bigint AS points \
+           FROM scored s JOIN users u ON u.id = s.user_id \
+           GROUP BY u.id, u.username \
+         ) \
+         SELECT username, points, count(*) OVER ()::bigint AS total FROM agg \
+         ORDER BY points DESC, username ASC LIMIT $2 OFFSET $3"
+    );
+
+    let page1: Vec<(String, i64, i64)> = sqlx::query_as(&sql)
+        .bind(200150).bind(2i64).bind(0i64)
+        .fetch_all(&pool).await.unwrap();
+    let page2: Vec<(String, i64, i64)> = sqlx::query_as(&sql)
+        .bind(200150).bind(2i64).bind(2i64)
+        .fetch_all(&pool).await.unwrap();
+
+    assert_eq!(page1.len(), 2, "第一页拿满 limit");
+    assert_eq!(page2.len(), 2, "第二页拿满 limit");
+    // ① total 与分页无关：两页必须都报 5
+    assert_eq!(page1[0].2, 5, "total 是全量条数，不受 limit 影响");
+    assert_eq!(page2[0].2, 5, "第二页的 total 同样是全量条数");
+    // ② 跨页不重复、不漏项
+    let mut names: Vec<String> = page1.iter().chain(page2.iter()).map(|r| r.0.clone()).collect();
+    names.sort();
+    names.dedup();
+    assert_eq!(names.len(), 4, "两页合起来必须是 4 个不同用户，无重复");
+    // ③ 排序稳定：第一页分数必须 >= 第二页（排序下推到 SQL 的直接后果）
+    assert!(
+        page1.last().unwrap().1 >= page2.first().unwrap().1,
+        "第一页末位分数不得低于第二页首位——否则说明排序没在 SQL 里生效"
+    );
+
+    // ④ 空页（offset 越界）时 total 拿不到 → handler 兜底为 0，entries 为空。
+    //    这里断言"确实返回 0 行"，handler 侧的 `unwrap_or(0)` 由此成立。
+    let empty: Vec<(String, i64, i64)> = sqlx::query_as(&sql)
+        .bind(200150).bind(2i64).bind(99i64)
+        .fetch_all(&pool).await.unwrap();
+    assert!(empty.is_empty(), "越界 offset 返回空页（handler 据此把 total 记 0 并停止翻页）");
+}
+
 /// 展示 token 与原始五维的**往返一致性**：管理端"看到什么就编辑什么"。
 ///
 /// ⚠️ 这条不变量有两处易错点：① `mode=default` 与 `custom+stock` 必须折叠成
