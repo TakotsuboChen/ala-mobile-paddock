@@ -45,6 +45,9 @@ pub struct DriverQuery {
     pub assist: Option<String>,
     /// `1` = 仅该用户各赛道各版本的最佳圈（与榜单同源）
     pub best: Option<i32>,
+    /// 排序方式：`time_desc`（缺省）/ `time_asc` / `lap_desc` / `lap_asc`。
+    /// 未知值回落 `time_desc`（前向兼容：客户端新版传新值、服务端旧版不报错）。
+    pub sort: Option<String>,
     pub limit: Option<i64>,
     pub offset: Option<i64>,
 }
@@ -54,6 +57,24 @@ impl DriverQuery {
         let limit = self.limit.unwrap_or(DEFAULT_PAGE_LIMIT).clamp(1, 100);
         let offset = self.offset.unwrap_or(0).max(0);
         (limit, offset)
+    }
+
+    /// 排序子句（**不含** `ORDER BY` 前缀）。
+    ///
+    /// ⚠️ 每个分支都必须带 `l.id` 兜底键，且方向与该分支主键一致：
+    /// LIMIT/OFFSET 分页在排序键有重复值时（同一秒上传的多圈、同毫秒的圈速）
+    /// 没有稳定次序，跨页会重复或漏项。`id` 是主键，唯一且不可变。
+    ///
+    /// ⚠️ `lap_asc` = 圈速从小到大 = **快的在前**（`lap_ms` 是毫秒数，越小越快）；
+    /// `lap_desc` 反之。命名跟的是数值方向而非"好坏"，与时间排序同一套语义。
+    fn order_by(&self) -> &'static str {
+        match self.sort.as_deref() {
+            Some("time_asc") => "l.created_at ASC, l.id ASC",
+            Some("lap_desc") => "l.lap_ms DESC, l.id DESC",
+            Some("lap_asc") => "l.lap_ms ASC, l.id ASC",
+            // 缺省 + 未知值：时间降序（最新上传在前），保持 2026-10-18 起的默认行为。
+            _ => "l.created_at DESC, l.id DESC",
+        }
     }
 }
 
@@ -255,8 +276,9 @@ pub async fn driver_page(
     // total 用独立 count：`count(*) OVER ()` 在空页时拿不到值（offset 越界），
     // 而客户端正是靠 total 判断"还有没有下一页"，空页返回 0 会被误判成没数据。
     let count_sql = format!("SELECT count(*) FROM laps l WHERE {where_sql}");
-    // 排序 = 时间倒序（最新上传在前）；同一时刻用 lap_id 兜底保证分页稳定
-    //（无稳定排序键时 LIMIT/OFFSET 可能跨页重复/漏项）。
+    // 排序由 `DriverQuery::order_by` 决定（时间/圈速 × 升降序四选一），
+    // 每个分支都带 `l.id` 兜底保证分页稳定。
+    let order_by = q.order_by();
     let data_sql = format!(
         "SELECT l.id, l.gp_index, l.version_code, l.lap_ms, l.created_at, \
                 l.pedal_mode, l.tc_mode, l.tc_strength, l.abs_mode, l.abs_strength, \
@@ -264,7 +286,7 @@ pub async fn driver_page(
                   AND b3.gp_index=l.gp_index AND b3.version_code=l.version_code \
                   AND b3.lap_ms=l.lap_ms) AS personal_best \
          FROM laps l WHERE {where_sql} \
-         ORDER BY l.created_at DESC, l.id DESC LIMIT ${limit_ph} OFFSET ${offset_ph}"
+         ORDER BY {order_by} LIMIT ${limit_ph} OFFSET ${offset_ph}"
     );
 
     // 绑定顺序必须与占位符序号一致。
