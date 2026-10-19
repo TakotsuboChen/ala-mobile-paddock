@@ -8,14 +8,27 @@
 #    仓库版缺 `GARAGE_ENDPOINT/KEY_ID/SECRET` 三个变量，而 `paddock-api/src/api/avatar.rs`
 #    读不到它们会直接返回 None（日志：`GARAGE_KEY_ID/GARAGE_SECRET 未配置，头像功能不可用`）
 #    ⇒ 照仓库版重建 = 头像功能静默失效。
-#    核对手法：`ssh ... "cat ~/paddock/docker-compose.vps.yml" | diff - deploy/docker-compose.vps.yml`
-#    必须无输出。改动一律先在 VPS 上验证，再回写本文件。
+#
+# ✅ **2026-10-19 起 tag 变量化，漂移从机制上不可能再发生**：
+#    镜像 tag 不再写死在文件里，而是 `PADDOCK_IMAGE` 环境变量，值落在 VPS `~/paddock/.env`
+#    （与密码同处，本来就不入仓）。**部署只改 `.env` 一行，本文件永不改动** ⇒
+#    「仓库版 vs VPS 版」不会再因为发版而产生差异。
+#
+#    历史教训：2026-10-18 与 2026-10-19 两次漂移都是同一个原因——部署时在 VPS 上
+#    `sed -i 's|image: paddock-api:vN|...|'` 改本文件，改完从不回写仓库。
+#    「记得回写」靠不住，把可变部分移出去才是根治。
+#
+#    核对手法（必须无输出）：
+#      ssh ... "cat ~/paddock/docker-compose.vps.yml" | diff - deploy/docker-compose.vps.yml
+#    实跑 tag 核对：
+#      ssh ... "sudo docker ps --format '{{.Image}}' | grep paddock-api"
+#      ssh ... "grep PADDOCK_IMAGE ~/paddock/.env"
 
 services:
   app:
-    # ⚠️ tag 与 VPS 实跑值一致（`docker ps --format '{{.Image}}'` 可核）。
-    #    `-paging` 后缀是分页功能批次的部署 tag，尚未提升为正式版本号。
-    image: paddock-api:1.0.1-paging
+    # 镜像 tag 由 VPS `.env` 的 `PADDOCK_IMAGE` 决定（见文件头「tag 变量化」）。
+    # 缺省值仅供首次部署/本地调试，生产以 `.env` 为准。
+    image: ${PADDOCK_IMAGE:-paddock-api:1.0.1-sort}
     restart: unless-stopped
     environment:
       DATABASE_URL: postgres://paddock:${POSTGRES_PASSWORD}@postgres:5432/paddock

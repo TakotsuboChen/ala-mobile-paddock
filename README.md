@@ -77,16 +77,25 @@ docker build -t paddock-api:1.0.0 .
 # 3. 导出传输（zstd 压缩省流量）
 docker save paddock-api:1.0.0 | zstd > paddock.tar.zst
 scp paddock.tar.zst user@vps:~/
-# 4. VPS 载入并重启（compose 镜像行已钉同一版本）
-ssh user@vps 'docker load < ~/paddock.tar.zst && docker compose -f ~/paddock/docker-compose.yml up -d'
-# 5. 验证：应返回 {"status":"ok","version":"1.0.0"}
-curl https://paddock.example.com/v1/health
+# 4. VPS 载入
+ssh user@vps 'docker load < ~/paddock.tar.zst'
+# 5. 改 .env 里的镜像 tag —— **不要改 compose 文件**
+ssh user@vps "sed -i 's|^PADDOCK_IMAGE=.*|PADDOCK_IMAGE=paddock-api:1.0.0|' ~/paddock/.env"
+# 6. 重启
+ssh user@vps 'cd ~/paddock && docker compose -f docker-compose.vps.yml up -d app'
+# 7. 验证
+curl https://paddock.example.com/v1/leaderboard/points?limit=1
 ```
+
+> ⚠️ **镜像 tag 只写在 `~/paddock/.env` 的 `PADDOCK_IMAGE`，compose 文件里是
+> `${PADDOCK_IMAGE:-...}` 变量引用。** 部署时**永远不要**用 `sed` 改
+> `docker-compose.vps.yml` —— 2026-10-18 与 2026-10-19 两次「仓库版与 VPS 版
+> 不一致」的事故都是这么来的（改完从不回写仓库）。变量化之后这条路径不再存在。
 
 版本规则：
 
 - 服务端版本 = `Cargo.toml` 的 `workspace.package.version`，编译期注入二进制，`/v1/health` 可核
-- 每次发布打 git tag `v<semver>`，Docker 镜像 tag `paddock-api:<semver>` 与 compose 镜像行三处同步
+- 每次发布打 git tag `v<semver>`，Docker 镜像 tag `paddock-api:<semver>` 与 `.env` 的 `PADDOCK_IMAGE` 同步
 - 变更记录见 [CHANGELOG.md](CHANGELOG.md)（Keep a Changelog 格式）；早期部署批次（服务端 v1~v39）与 1.0.0 的关系见 CHANGELOG「版本约定」
 
 ## 运维速记（详见 PADDOCK_PLAN.md）
