@@ -104,34 +104,31 @@ async fn wipe(pool: &PgPool) {
 ///
 /// ️ 与 handler 里的拼接**必须逐字同步**（含 `scored` 带下的四个派生位列）——
 /// 本文件是"能在真库上跑"的镜像，不同步就等于测试不再覆盖生产 SQL。
+/// 2026-10-19：窗口定义改为直接复用 `score::scored_cte`，与 handler 同源，
+/// 不再手抄一遍 `ranked` + `scored`。
 async fn points_board_sql(
     pool: &PgPool,
     version: Option<i32>,
 ) -> Vec<(Uuid, i64, i64, i64, bool)> {
-    let (partition, gold_expr) = match version {
-        Some(_) => ("bl.gp_index", "2 * count(*) FILTER (WHERE s.tc_off AND s.abs_off) >= count(*)"),
-        None => (
-            "bl.version_code, bl.gp_index",
+    let gold_expr = match version {
+        Some(_) => "2 * count(*) FILTER (WHERE s.tc_off AND s.abs_off) >= count(*)",
+        None => {
             "count(*) FILTER (WHERE s.tc_off AND s.abs_off) > 0 \
-             AND 2 * count(*) FILTER (WHERE s.tc_off AND s.abs_off) >= count(*)",
-        ),
+             AND 2 * count(*) FILTER (WHERE s.tc_off AND s.abs_off) >= count(*)"
+        }
     };
-    let base = score::base_sql("rank_in_track", "n_in_track");
     let bonus = score::bonus_sql("s.base_pts", "s");
     let sql = format!(
-        "WITH ranked AS ( \
-           SELECT bl.user_id, bl.tc_off, bl.abs_off, bl.pedal_linear, bl.abs_low, \
-                  rank() OVER (PARTITION BY {partition} ORDER BY bl.lap_ms ASC) AS rank_in_track, \
-                  count(*) OVER (PARTITION BY {partition}) AS n_in_track \
-           FROM best_laps bl {vf} \
-         ), scored AS ( \
-           SELECT user_id, tc_off, abs_off, pedal_linear, abs_low, {base} AS base_pts FROM ranked \
-         ) \
+        "{scored} \
          SELECT u.id, sum(s.base_pts + {bonus})::bigint, count(*)::bigint, \
                 count(*) FILTER (WHERE s.tc_off AND s.abs_off)::bigint, ({gold_expr}) \
          FROM scored s JOIN users u ON u.id = s.user_id \
          GROUP BY u.id ORDER BY 2 DESC",
-        vf = version.map(|_| "WHERE bl.version_code = $1".to_string()).unwrap_or_default(),
+        scored = score::scored_cte(if version.is_some() {
+            "WHERE bl.version_code = $1"
+        } else {
+            ""
+        }),
     );
     let mut q = sqlx::query_as::<_, (Uuid, i64, i64, i64, bool)>(&sql);
     if let Some(v) = version { q = q.bind(v); }
@@ -337,25 +334,20 @@ async fn sql_pagination_is_stable_and_total_is_page_independent() {
         ).await;
     }
 
-    // 复刻 points_board 的分页外壳（排序下推 + total 窗口）
-    let base = score::base_sql("rank_in_track", "n_in_track");
+    // 复刻 points_board 的分页外壳（排序下推 + total 窗口）。
+    // 2026-10-19：窗口段复用 score::scored_cte（与 handler 同源）。
     let bonus = score::bonus_sql("s.base_pts", "s");
     let sql = format!(
-        "WITH ranked AS ( \
-           SELECT bl.user_id, bl.tc_off, bl.abs_off, bl.pedal_linear, bl.abs_low, \
-                  rank() OVER (PARTITION BY bl.gp_index ORDER BY bl.lap_ms ASC) AS rank_in_track, \
-                  count(*) OVER (PARTITION BY bl.gp_index) AS n_in_track \
-           FROM best_laps bl WHERE bl.version_code = $1 \
-         ), scored AS ( \
-           SELECT user_id, tc_off, abs_off, pedal_linear, abs_low, {base} AS base_pts FROM ranked \
-         ), agg AS ( \
+        "{scored}, \
+         agg AS ( \
            SELECT u.id AS user_id, u.username AS username, \
                   sum(s.base_pts + {bonus})::bigint AS points \
            FROM scored s JOIN users u ON u.id = s.user_id \
            GROUP BY u.id, u.username \
          ) \
          SELECT username, points, count(*) OVER ()::bigint AS total FROM agg \
-         ORDER BY points DESC, username ASC LIMIT $2 OFFSET $3"
+         ORDER BY points DESC, username ASC LIMIT $2 OFFSET $3",
+        scored = score::scored_cte("WHERE bl.version_code = $1"),
     );
 
     let page1: Vec<(String, i64, i64)> = sqlx::query_as(&sql)
@@ -481,4 +473,176 @@ async fn migration_adds_assist_columns_with_false_defaults() {
     let pm: Option<String> = sqlx::query_scalar("SELECT pedal_mode FROM laps WHERE user_id=$1")
         .bind(uid).fetch_one(&pool).await.unwrap();
     assert!(pm.is_none(), "旧数据配置列必须为 NULL");
+}
+/// **主页名次必须等于榜单行号**（2026-10-19 新增）。
+///
+/// 这条测试存在的理由：`score::user_points_and_rank` 用 `row_number()`，
+/// 而"看起来很自然"的 `rank()` 在同分时会跳号（1,1,3）。车手主页显示
+/// "总排名 N"，用户在积分榜里数行号却是 N+1 —— 肉眼可见的矛盾。
+/// 单元测试发现不了（`rank()` 与 `row_number()` 在无并列时结果相同），
+/// 只有真库 + 并列数据才能暴露。
+#[tokio::test]
+#[ignore]
+async fn driver_rank_matches_board_row_number() {
+    let Some(pool) = setup().await else { return };
+    wipe(&pool).await;
+    // 造三人在同一赛道同一版本，且**成绩完全相同** → 积分并列。
+    // 积分相同后由 username ASC 定序，故 c > b > a。
+    for (i, name) in ["a", "b", "c"].iter().enumerate() {
+        let uid = mk_user(&pool, name, i as i64 + 1).await;
+        mk_lap(
+            &pool, uid, 0, 200150, 90_000,
+            Some("off"), Some("default"), Some("stock"), Some("default"), Some("stock"),
+        ).await;
+    }
+    let ids: Vec<(Uuid, String)> = sqlx::query_as("SELECT id, username FROM users")
+        .fetch_all(&pool).await.unwrap();
+
+    // ① 榜单行号（与 points_board 的 ORDER BY 逐字一致）
+    let board = points_board_sql(&pool, Some(200150)).await;
+    let board_names: Vec<String> = board.iter().map(|r| {
+        ids.iter().find(|(id, _)| id == &r.0).unwrap().1.clone()
+    }).collect();
+    assert_eq!(board_names, vec!["a", "b", "c"], "同分按 username 升序定序");
+
+    // ② 每个人的 rank 必须 = 他在榜单里的下标 + 1
+    for (idx, (uid, name)) in ids.iter().enumerate() {
+        let (_points, rank) = score::user_points_and_rank(&pool, *uid, Some(200150))
+            .await.unwrap();
+        assert_eq!(
+            rank, Some(idx as i64 + 1),
+            "{name} 的主页名次必须等于榜单行号（rank() 会跳号，row_number() 不会）"
+        );
+    }
+
+    // ③ 反证：`rank()` 在这里会给出 1,1,1（三人同分），与行号 1,2,3 不符。
+    let rank_fn: Vec<i64> = sqlx::query_scalar(
+        "SELECT rank() OVER (ORDER BY points DESC)::bigint FROM ( \
+           SELECT 100::bigint AS points FROM generate_series(1,3) \
+         ) t",
+    ).fetch_all(&pool).await.unwrap();
+    assert_eq!(rank_fn, vec![1, 1, 1], "rank() 对同分并列——这正是不能用它的原因");
+}
+
+/// 版本维度四值（版本积分/版本排名/纪录数/纪录排名）的口径守卫。
+///
+/// 用户定案（2026-10-19）：纪录数 = **版本 × 赛道**，同一条赛道在 8.0.4 与
+/// 8.0.6 各算一条、不跨版本混算。这条测试专门盯住"别把版本过滤丢了"。
+#[tokio::test]
+#[ignore]
+async fn version_scope_is_not_cross_version() {
+    let Some(pool) = setup().await else { return };
+    wipe(&pool).await;
+    let a = mk_user(&pool, "a", 1).await;
+    let b = mk_user(&pool, "b", 2).await;
+    // a 在**两个版本**的 0 号赛道都是纪录保持者
+    for ver in [200146, 200150] {
+        mk_lap(&pool, a, 0, ver, 90_000, None, None, None, None, None).await;
+        sqlx::query(
+            "INSERT INTO records (gp_index, kind, version_code, lap_ms, user_id) \
+             VALUES (0,'version',$1,90000,$2)",
+        ).bind(ver).bind(a).execute(&pool).await.unwrap();
+    }
+    // b 只在旧版本的 1 号赛道有纪录
+    mk_lap(&pool, b, 1, 200146, 95_000, None, None, None, None, None).await;
+    sqlx::query(
+        "INSERT INTO records (gp_index, kind, version_code, lap_ms, user_id) \
+         VALUES (1,'version',200146,95000,$1)",
+    ).bind(b).execute(&pool).await.unwrap();
+
+    // 最新版本 = max(version_code) = 200150
+    let latest: Option<i32> = sqlx::query_scalar("SELECT max(version_code) FROM best_laps")
+        .fetch_one(&pool).await.unwrap();
+    assert_eq!(latest, Some(200150));
+
+    // a 在最新版本持有 1 条纪录（不是 2 条——旧版本那条不计入）
+    let a_cnt: i64 = sqlx::query_scalar(
+        "SELECT count(*)::bigint FROM records \
+         WHERE kind='version' AND version_code=$1 AND user_id=$2",
+    ).bind(200150).bind(a).fetch_one(&pool).await.unwrap();
+    assert_eq!(a_cnt, 1, "纪录数按版本切分，旧版本的纪录不能算进最新版本");
+
+    // ⚠️ 上面这条只验证"单版本切片"的 SQL 正确性；**车手主页展示的 `record_count`
+    //    用的是跨版本累计口径**（见下面 record_count_crosses_versions 测试）——
+    //    用户 2026-10-19 定案：只查 max(version_code) 会让"只在旧版本有纪录的人"
+    //    显示 0（实机：Takotsubo 在 8.0.4 有 5 条、8.0.6 零条 ⇒ 旧实现显示 0）。
+
+    // b 只在旧版本有 1 条纪录 → 新口径下仍参与排名（跨版本累计，不按版本截断）
+    let b_rank: Option<i64> = sqlx::query_scalar(
+        "WITH per_user AS ( \
+           SELECT user_id, count(*)::bigint AS cnt \
+           FROM records WHERE kind='version' \
+           GROUP BY user_id \
+         ), ranked AS ( \
+           SELECT p.user_id, \
+                  row_number() OVER (ORDER BY p.cnt DESC, u.reg_seq ASC)::bigint AS \"rank\" \
+           FROM per_user p JOIN users u ON u.id = p.user_id \
+         ) \
+         SELECT \"rank\" FROM ranked WHERE user_id=$1",
+    ).bind(b).fetch_optional(&pool).await.unwrap();
+    assert_eq!(b_rank, Some(2), "旧版本的纪录也计入（b 有 1 条，排在 a 的 2 条之后）");
+
+    // 版本积分：a 在 200150 有 1 条赛道第一（N=1 → 100 分）；总积分含两版本 → 200
+    let (v_pts, v_rank) = score::user_points_and_rank(&pool, a, Some(200150)).await.unwrap();
+    assert_eq!(v_pts, 100, "版本积分只算该版本");
+    assert_eq!(v_rank, Some(1));
+    let (t_pts, _) = score::user_points_and_rank(&pool, a, None).await.unwrap();
+    assert_eq!(t_pts, 200, "总积分 = 各版本独立计分累加（版本=独立赛季）");
+}
+
+/// **全服最快圈数量必须跨版本累计**（2026-10-19 实机 bug 回归测试）。
+///
+/// 旧实现查 `version_code = max(...)`，导致"只在旧版本有纪录的人"显示 0。
+/// 实机证据：Takotsubo 在 8.0.4 持有 5 条版本纪录（gp 0/1/2/5/12）、8.0.6 零条，
+/// 车手主页却显示「全服最快圈数量 0」。
+///
+/// 用户定案口径：「版本-赛道记录，同赛道也分版本，不是所有版本混一起」——
+/// 即 `records(kind='version')` 里该用户持有的**组合数**：同赛道在两个版本各算一条，
+/// 但**不按版本截断**。
+#[tokio::test]
+#[ignore]
+async fn record_count_crosses_versions() {
+    let Some(pool) = setup().await else { return };
+    wipe(&pool).await;
+    let a = mk_user(&pool, "a", 1).await;
+    let b = mk_user(&pool, "b", 2).await;
+
+    // a：旧版本 2 条 + 最新版本 1 条 → 跨版本累计 3
+    for (gp, ver) in [(0i16, 200146), (1, 200146), (2, 200150)] {
+        sqlx::query(
+            "INSERT INTO records (gp_index, kind, version_code, lap_ms, user_id) \
+             VALUES ($1,'version',$2,90000,$3)",
+        ).bind(gp).bind(ver).bind(a).execute(&pool).await.unwrap();
+    }
+    // b：只有最新版本 1 条
+    sqlx::query(
+        "INSERT INTO records (gp_index, kind, version_code, lap_ms, user_id) \
+         VALUES (0,'version',200150,91000,$1)",
+    ).bind(b).execute(&pool).await.unwrap();
+
+    // ① 跨版本计数：a = 3（旧 2 + 新 1），b = 1
+    let a_cnt: i64 = sqlx::query_scalar(
+        "SELECT count(*)::bigint FROM records WHERE kind='version' AND user_id=$1",
+    ).bind(a).fetch_one(&pool).await.unwrap();
+    assert_eq!(a_cnt, 3, "全服最快圈数量必须跨版本累计（旧实现的 max(version) 截断会漏掉旧版本）");
+
+    // ② 反证：只查最新版本会得到 1（这就是 bug 的表现）
+    let a_latest: i64 = sqlx::query_scalar(
+        "SELECT count(*)::bigint FROM records \
+         WHERE kind='version' AND version_code=200150 AND user_id=$1",
+    ).bind(a).fetch_one(&pool).await.unwrap();
+    assert_eq!(a_latest, 1, "按最新版本截断只有 1 条 —— 正是用户报的「显示 0/偏小」的成因");
+
+    // ③ 名次按跨版本计数降序：a(3) 第 1、b(1) 第 2
+    let ranked: Vec<(Uuid, i64)> = sqlx::query_as(
+        "WITH per_user AS ( \
+           SELECT user_id, count(*)::bigint AS cnt \
+           FROM records WHERE kind='version' GROUP BY user_id \
+         ) \
+         SELECT p.user_id, \
+                row_number() OVER (ORDER BY p.cnt DESC, u.reg_seq ASC)::bigint \
+         FROM per_user p JOIN users u ON u.id = p.user_id \
+         ORDER BY 2",
+    ).fetch_all(&pool).await.unwrap();
+    assert_eq!(ranked, vec![(a, 1), (b, 2)], "名次按跨版本纪录数降序，同数按车手号定序");
 }

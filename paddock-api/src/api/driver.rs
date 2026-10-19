@@ -27,10 +27,11 @@ use uuid::Uuid;
 
 use crate::{
     api::{
-        auth_handlers::{ApiError, total_points_of},
+        auth_handlers::ApiError,
         laps::{assist_display, track_display_name, version_display},
         leaderboard::{DEFAULT_PAGE_LIMIT, format_lap_ms},
     },
+    score,
     state::AppState,
 };
 
@@ -85,12 +86,26 @@ pub struct DriverProfile {
     pub avatar_url: Option<String>,
     /// 计时赛总积分（与 `/v1/me`、积分总榜同口径）
     pub total_points: i64,
+    /// 总积分在总榜里的**行号**（与榜单展示顺序逐行对齐；无成绩 = null）
+    pub total_rank: Option<i64>,
     /// 有成绩的赛道数（best_laps 维度，与积分榜 best_count 同义）
     pub best_count: i64,
     /// 其中零辅助最快圈的条数（积分榜 zero_count 同义）
     pub zero_count: i64,
     /// 积分榜同款金标（服务端判定的唯一事实源）
     pub gold: bool,
+    /// ── 版本维度（2026-10-19 新增，`version` 恒为当前最新版本）──
+    /// 该版本口径的积分与名次（版本榜 = 独立赛季）
+    pub version_points: i64,
+    pub version_rank: Option<i64>,
+    /// 该版本号本身，客户端用于展示"8.0.6"
+    pub version_code: Option<i32>,
+    pub version_name: String,
+    /// 该用户在当前最新版本下**持有的赛道纪录数**（records.kind='version'）。
+    /// 口径是"版本 × 赛道"：同一条赛道在 8.0.4 与 8.0.6 各算一条，不跨版本混算。
+    pub record_count: i64,
+    /// 上述纪录数在所有车手中的名次（降序；无纪录 = null）
+    pub record_rank: Option<i64>,
 }
 
 #[derive(Serialize)]
@@ -133,7 +148,60 @@ pub async fn driver_page(
     let Some((username, reg_seq, avatar_url, best_count, zero_count)) = profile_row else {
         return Err(ApiError::not_found("车手不存在"));
     };
-    let total_points = total_points_of(&state, user_id).await?;
+    // 总积分 + 总名次：与积分总榜同口径、同行号（单一实现点见 score.rs）。
+    let (total_points, total_rank) = score::user_points_and_rank(&state.pool, user_id, None).await?;
+
+    // ── 版本维度（2026-10-19）──
+    // "最新版本"**从数据里现取**，不硬编码：游戏升版后新圈入库即自动切换，
+    // 无需改代码/发版。取 `max(version_code)` 而非"当前模块适配版本"，
+    // 是因为车手主页是公开页面、服务的是**已发生的事实**（谁在最新版本跑出了
+    // 什么成绩），而不是"模块此刻支持哪个版本"。
+    let latest_version: Option<i32> =
+        sqlx::query_scalar("SELECT max(version_code) FROM best_laps")
+            .fetch_one(&state.pool)
+            .await?;
+    let (version_points, version_rank) = match latest_version {
+        Some(v) => score::user_points_and_rank(&state.pool, user_id, Some(v)).await?,
+        None => (0, None),
+    };
+    let version_name = latest_version.map(version_display).unwrap_or_default();
+
+    // ── 全服最快圈数量（2026-10-19 修正口径）──
+    // 用户定案："版本-赛道记录，同赛道也分版本，不是所有版本混一起"。
+    //
+    // ⚠️ **不能只查 `version_code = max(...)`**：最新版本（8.0.6）可能一条纪录都
+    //    没有（实机：Takotsubo 在 8.0.4 持有 5 条，8.0.6 零条 ⇒ 旧实现显示 0）。
+    //    正确口径 = 该用户在 `records(kind='version')` 里**持有纪录的 (版本, 赛道) 组合数**：
+    //    同一条赛道在 8.0.4 与 8.0.6 各算一条（版本维度保留），但**不按版本截断**。
+    //    `records` 主键是 (gp_index, kind, version_code) ⇒ 每组合恰好一行，
+    //    故直接 count(*) 即为组合数。
+    let record_count: i64 = sqlx::query_scalar(
+        "SELECT count(*)::bigint FROM records \
+         WHERE kind='version' AND user_id=$1",
+    )
+    .bind(user_id)
+    .fetch_one(&state.pool)
+    .await?;
+
+    // 名次 = 该口径下按纪录数降序的行号（同数按 reg_seq 定序，稳定可复现）。
+    // ⚠️ 只统计**有纪录的人**：零纪录者不参与排名（返回 null），否则「第 N 名」
+    //    里会混进一堆 0 条纪录的人，名次虚高。
+    let record_rank: Option<i64> = sqlx::query_scalar(
+        "WITH per_user AS ( \
+           SELECT user_id, count(*)::bigint AS cnt \
+           FROM records WHERE kind='version' \
+           GROUP BY user_id \
+         ), ranked AS ( \
+           SELECT p.user_id, \
+                  row_number() OVER (ORDER BY p.cnt DESC, u.reg_seq ASC)::bigint AS \"rank\" \
+           FROM per_user p JOIN users u ON u.id = p.user_id \
+         ) \
+         SELECT \"rank\" FROM ranked WHERE user_id=$1",
+    )
+    .bind(user_id)
+    .fetch_optional(&state.pool)
+    .await?;
+
     let gold = zero_count > 0 && 2 * zero_count >= best_count;
     let profile = DriverProfile {
         user_id,
@@ -141,9 +209,16 @@ pub async fn driver_page(
         reg_seq,
         avatar_url,
         total_points,
+        total_rank,
         best_count,
         zero_count,
         gold,
+        version_points,
+        version_rank,
+        version_code: latest_version,
+        version_name,
+        record_count,
+        record_rank,
     };
 
     // ── 圈速记录（分页）──

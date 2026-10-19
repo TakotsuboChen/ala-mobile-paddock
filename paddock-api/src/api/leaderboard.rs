@@ -88,17 +88,21 @@ pub async fn points_board(
     Query(f): Query<VersionFilter>,
 ) -> Result<Json<PointsBoard>, ApiError> {
     let (limit, offset) = f.page();
-    // 两个榜只差窗口分区与金标的存在性条件，其余 SQL 由 score 模块的片段拼出。
-    let (partition, gold_expr) = match f.version {
-        Some(_) => ("bl.gp_index", "2 * count(*) FILTER (WHERE s.tc_off AND s.abs_off) >= count(*)"),
-        None => (
-            "bl.version_code, bl.gp_index",
+    // 两个榜只差金标的存在性条件，其余（窗口 + 基础分）由 score 模块的
+    // [`score::scored_cte`] 生成——与 `/v1/me`、车手主页共用同一份窗口定义。
+    let gold_expr = match f.version {
+        Some(_) => "2 * count(*) FILTER (WHERE s.tc_off AND s.abs_off) >= count(*)",
+        None => {
             "count(*) FILTER (WHERE s.tc_off AND s.abs_off) > 0 \
-             AND 2 * count(*) FILTER (WHERE s.tc_off AND s.abs_off) >= count(*)",
-        ),
+             AND 2 * count(*) FILTER (WHERE s.tc_off AND s.abs_off) >= count(*)"
+        }
     };
-    let base = score::base_sql("rank_in_track", "n_in_track");
     let bonus = score::bonus_sql("s.base_pts", "s");
+    let scored = score::scored_cte(if f.version.is_some() {
+        "WHERE bl.version_code = $1"
+    } else {
+        ""
+    });
 
     // 层级说明：Postgres 不允许在同一 SELECT 列表里引用窗口函数别名，
     // 也不允许引用同层的普通别名 → 窗口(ranked) → 基础分(scored) → 加成(最外层) 三层。
@@ -113,15 +117,7 @@ pub async fn points_board(
     //    points DESC, username ASC（与原 Rust 排序逐字等价）+ LIMIT/OFFSET。
     //    `total` 由同一条 CTE 的 count 窗口在分页前算好，省一次全表 count。
     let sql = format!(
-        "WITH ranked AS ( \
-           SELECT bl.user_id, bl.tc_off, bl.abs_off, bl.pedal_linear, bl.abs_low, \
-                  rank() OVER (PARTITION BY {partition} ORDER BY bl.lap_ms ASC) AS rank_in_track, \
-                  count(*) OVER (PARTITION BY {partition}) AS n_in_track \
-           FROM best_laps bl {version_filter} \
-         ), \
-         scored AS ( \
-           SELECT user_id, tc_off, abs_off, pedal_linear, abs_low, {base} AS base_pts FROM ranked \
-         ), \
+        "{scored}, \
          agg AS ( \
            SELECT u.id AS user_id, u.reg_seq AS reg_seq, u.username AS username, \
                   (CASE WHEN u.avatar_key IS NOT NULL \
@@ -135,10 +131,6 @@ pub async fn points_board(
          ) \
          SELECT *, count(*) OVER ()::bigint AS total FROM agg \
          ORDER BY points DESC, username ASC LIMIT ${limit_ph} OFFSET ${offset_ph}",
-        version_filter = f
-            .version
-            .map(|_| "WHERE bl.version_code = $1".to_string())
-            .unwrap_or_default(),
         limit_ph = if f.version.is_some() { 2 } else { 1 },
         offset_ph = if f.version.is_some() { 3 } else { 2 },
     );

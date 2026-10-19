@@ -7,6 +7,10 @@
 //!    本模块存在的意义就是让"参与运算的那些副本"不再各写一遍字符串拼接，
 //!    而未参与运算的副本（`total_points` 的独立查询）仍需手工同步。
 //!
+//! 2026-10-19 进一步收口：窗口定义抽成 [`scored_cte`]，积分聚合抽成
+//! [`user_points_and_rank`]。榜单 / `/v1/me` / 车手主页现在共用同一份 CTE，
+//! 不再各拼一遍 `ranked` + `scored`。
+//!
 //! ## 积分 = 名次基础分 + 辅助加成
 //!
 //! 基础分（v40 定案，2026-09-04）：
@@ -182,6 +186,79 @@ pub fn bonus_sql(base_expr: &str, bl: &str) -> String {
            ELSE GREATEST(1, round(({base_expr}) * ({pct}))) \
          END"
     )
+}
+
+/// 全量车手积分聚合的 CTE 前半段（`ranked` + `scored` 两层）。
+///
+/// 榜单、`/v1/me` 的总积分、车手主页的"总积分/总排名"三处**共用这一段**——
+/// 它们的差别只有窗口分区与是否过滤版本，而分区与过滤是同一件事：
+/// 版本榜 `WHERE version_code = $1` 之后 `version_code` 恒定，
+/// `PARTITION BY version_code, gp_index` 与 `PARTITION BY gp_index` 等价，
+/// 故**统一按总榜分区写**，版本榜只靠 WHERE 收窄。这样三处只有一份窗口定义。
+///
+/// 调用方负责在外面接 `agg`（按 user 分组求和）并追加自己的过滤/排序。
+/// 返回的 SQL 以 `scored` CTE 结尾，不含末尾逗号。
+pub fn scored_cte(version_filter: &str) -> String {
+    let base = base_sql("rank_in_track", "n_in_track");
+    format!(
+        "WITH ranked AS ( \
+           SELECT bl.user_id, bl.tc_off, bl.abs_off, bl.pedal_linear, bl.abs_low, \
+                  rank() OVER (PARTITION BY bl.version_code, bl.gp_index \
+                               ORDER BY bl.lap_ms ASC) AS rank_in_track, \
+                  count(*) OVER (PARTITION BY bl.version_code, bl.gp_index) AS n_in_track \
+           FROM best_laps bl {version_filter} \
+         ), \
+         scored AS ( \
+           SELECT user_id, tc_off, abs_off, pedal_linear, abs_low, {base} AS base_pts FROM ranked \
+         )"
+    )
+}
+
+/// 单用户积分 + 名次（`/v1/me`、车手主页共用）。
+///
+/// 名次用 `row_number()` 而非 `rank()`：**必须与积分榜的展示顺序逐行对齐**——
+/// 榜单是 `ORDER BY points DESC, username ASC` 再按行号显示名次，`rank()` 遇到
+/// 同分并列会跳号（1,1,3），主页就会显示"第 2 名"而榜单里他在第 3 行。
+/// `row_number()` 保证主页名次 = 该用户在榜单里的行号。
+///
+/// `version = None` → 总榜口径（各版本独立计分累加）；`Some(v)` → 该版本口径。
+/// 返回 `(points, rank)`；该用户完全没成绩时 rank 为 `None`（积分恒 0）。
+pub async fn user_points_and_rank(
+    pool: &sqlx::PgPool,
+    user_id: uuid::Uuid,
+    version: Option<i32>,
+) -> Result<(i64, Option<i64>), sqlx::Error> {
+    let (vf, bind_version) = match version {
+        Some(_) => ("WHERE bl.version_code = $1", true),
+        None => ("", false),
+    };
+    let bonus = bonus_sql("s.base_pts", "s");
+    // 名次在全量聚合之后算：`row_number() OVER (ORDER BY points DESC, username ASC)`
+    // 与榜单 SQL 的 ORDER BY 逐字一致（含同分时按用户名定序的兜底）。
+    let sql = format!(
+        "{cte}, \
+         agg AS ( \
+           SELECT u.id AS user_id, u.username AS username, \
+                  sum(s.base_pts + {bonus})::bigint AS points \
+           FROM scored s JOIN users u ON u.id = s.user_id \
+           GROUP BY u.id, u.username \
+         ), \
+         ranked_users AS ( \
+           SELECT user_id, points, \
+                  row_number() OVER (ORDER BY points DESC, username ASC)::bigint AS \"rank\" \
+           FROM agg \
+         ) \
+         SELECT points, \"rank\" FROM ranked_users WHERE user_id = ${ph}",
+        cte = scored_cte(vf),
+        ph = if bind_version { 2 } else { 1 },
+    );
+    let mut q = sqlx::query_as::<_, (i64, i64)>(&sql);
+    if let Some(v) = version {
+        q = q.bind(v);
+    }
+    let row = q.bind(user_id).fetch_optional(pool).await?;
+    // 无成绩 = 不在 agg 里（best_laps 无行）→ 积分 0、无名次。
+    Ok(row.map(|(p, r)| (p, Some(r))).unwrap_or((0, None)))
 }
 
 #[cfg(test)]

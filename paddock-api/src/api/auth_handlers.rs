@@ -342,28 +342,17 @@ pub async fn me(
 
 /// 计时赛总积分（版本=独立赛季累加；`/v1/me` 与车手主页共用）。
 ///
-/// **单一实现点**：公式两段 SQL 都来自 [`crate::score`]，窗口必须基于全量
-/// `best_laps` 再过滤用户（见调用点注释）。
+/// **单一实现点**：窗口与加成 SQL 全部来自 [`crate::score`]。2026-10-19 起
+/// 连聚合本身也收口到 [`crate::score::user_points_and_rank`]——它同时给出
+/// 名次，车手主页要显示"总排名"，而名次必须与榜单的行号对齐。
+///
+/// ⚠️ 代价是这里也做了一次**全量**聚合（算名次必须看到所有用户），而旧实现
+///    只扫该用户自己的行。用户量级（16 赛道 × 数千人）下差异可忽略，且
+///    `/v1/me` 不是热路径（模块启动/进围场页各一次）。换来的是"积分只有一处
+///    算法"——这比省那点扫描更值。
 pub async fn total_points_of(state: &AppState, user_id: Uuid) -> Result<i64, ApiError> {
-    let base_expr = score::base_sql("rank_in_track", "n_in_track");
-    let score_sql = format!(
-        r#"WITH per_track AS (
-             SELECT user_id, version_code, gp_index, lap_ms,
-                    rank() OVER (PARTITION BY version_code, gp_index ORDER BY lap_ms ASC) AS rank_in_track,
-                    count(*) OVER (PARTITION BY version_code, gp_index) AS n_in_track,
-                    pedal_linear, tc_off, abs_off, abs_low
-             FROM best_laps
-           ), scored AS (
-             SELECT user_id, {base_expr} AS base_pts, pedal_linear, tc_off, abs_off, abs_low
-             FROM per_track
-           )
-           SELECT coalesce(sum(base_pts + {bonus}), 0)::bigint FROM scored WHERE user_id = $1"#,
-        bonus = score::bonus_sql("base_pts", "scored"),
-    );
-    Ok(sqlx::query_scalar(&score_sql)
-        .bind(user_id)
-        .fetch_one(&state.pool)
-        .await?)
+    let (points, _rank) = score::user_points_and_rank(&state.pool, user_id, None).await?;
+    Ok(points)
 }
 
 async fn user_exists(pool: &PgPool, username: &str) -> Result<bool, ApiError> {
