@@ -89,6 +89,12 @@ pub struct DriverLapEntry {
     pub lap_display: String,
     /// 该圈是否是"该车手在该赛道该版本的个人最佳"（= best_laps 里的那条）
     pub personal_best: bool,
+    /// 该圈是否被本人「屏蔽缺失配置记录」动作移出了榜单（2026-10-20）。
+    ///
+    /// ⚠️ 与 `personal_best` **互斥**：屏蔽即从 `best_laps` 删行，被屏蔽的圈
+    ///    不可能同时是 personal_best。客户端用红标「已屏蔽」区分，蓝标「最佳」
+    ///    仍只认 `personal_best`。
+    pub hidden: bool,
     /// 辅助配置三维展示（踏板 / TC / ABS）。缺失维显示"缺失"。
     pub pedal: String,
     pub tc: String,
@@ -284,10 +290,19 @@ pub async fn driver_page(
                 l.pedal_mode, l.tc_mode, l.tc_strength, l.abs_mode, l.abs_strength, \
                 EXISTS (SELECT 1 FROM best_laps b3 WHERE b3.user_id=l.user_id \
                   AND b3.gp_index=l.gp_index AND b3.version_code=l.version_code \
-                  AND b3.lap_ms=l.lap_ms) AS personal_best \
+                  AND b3.lap_ms=l.lap_ms) AS personal_best, \
+                EXISTS (SELECT 1 FROM hidden_missing_laps h \
+                  WHERE h.user_id=l.user_id AND h.lap_id=l.id) AS hidden \
          FROM laps l WHERE {where_sql} \
          ORDER BY {order_by} LIMIT ${limit_ph} OFFSET ${offset_ph}"
     );
+
+    // ⚠️ `personal_best` 与 `hidden` 的互斥性在 Rust 侧强制，而不是只靠 UI 的
+    //    显示优先级：`personal_best` 按 **lap_ms 相等**判定（沿用既有口径），
+    //    若同一维度存在两条毫秒相同的圈、其中一条被屏蔽，另一条被回放成
+    //    best_laps，则两条都会命中 lap_ms 相等——被屏蔽那条会同时带两个标。
+    //    这里直接清掉 personal_best，让"已屏蔽 = 不在榜上"成为数据事实。
+    //    客户端因此可以无条件先判 hidden，不必依赖 if/else 顺序。
 
     // 绑定顺序必须与占位符序号一致。
     let mut cq = sqlx::query_scalar::<_, i64>(&count_sql).bind(user_id);
@@ -312,6 +327,7 @@ pub async fn driver_page(
         abs_mode: Option<String>,
         abs_strength: Option<String>,
         personal_best: bool,
+        hidden: bool,
     }
     let mut dq = sqlx::query_as::<_, LapRow>(&data_sql).bind(user_id);
     if let Some(g) = q.gp_index {
@@ -344,7 +360,9 @@ pub async fn driver_page(
                 version_name: version_display(r.version_code),
                 lap_ms: r.lap_ms,
                 lap_display: format_lap_ms(r.lap_ms),
-                personal_best: r.personal_best,
+                // 互斥强制（见 data_sql 上方的注释）：被屏蔽的圈不可能是"最佳"。
+                personal_best: r.personal_best && !r.hidden,
+                hidden: r.hidden,
                 pedal,
                 tc,
                 abs,

@@ -1343,11 +1343,20 @@ async fn recalc_dims(
     ver: i32,
 ) -> anyhow::Result<()> {
     // 重算 best_laps：最快圈的圈速 + 该圈的辅助配置（同一行取出，保证同源）
+    //
+    // ⚠️ **必须排除被本人屏蔽的圈**（2026-10-20）：屏蔽动作把 best_laps 行删了，
+    //    若这里重算时不排除，管理端任何一次编辑/删除触发本函数，被屏蔽的记录
+    //    就会被拉回榜单——用户看到"屏蔽了又回来了"，且不可撤销的承诺被打破。
+    //    排除依据是 hidden_missing_laps 的 lap_id（快照语义），**不是**配置判据：
+    //    屏蔽后新上传的缺失圈不在表里，照常参与竞争（用户定案）。
     let ub: Option<(i32, Option<String>, Option<String>, Option<String>, Option<String>, Option<String>)> =
         sqlx::query_as(
-            "SELECT lap_ms, pedal_mode, tc_mode, tc_strength, abs_mode, abs_strength \
-             FROM laps WHERE user_id=$1 AND gp_index=$2 AND version_code=$3 \
-             ORDER BY lap_ms ASC, created_at ASC LIMIT 1",
+            "SELECT l.lap_ms, l.pedal_mode, l.tc_mode, l.tc_strength, l.abs_mode, l.abs_strength \
+             FROM laps l \
+             WHERE l.user_id=$1 AND l.gp_index=$2 AND l.version_code=$3 \
+               AND NOT EXISTS (SELECT 1 FROM hidden_missing_laps h \
+                               WHERE h.user_id=l.user_id AND h.lap_id=l.id) \
+             ORDER BY l.lap_ms ASC, l.created_at ASC LIMIT 1",
         )
         .bind(uid)
         .bind(gp)
@@ -1397,17 +1406,23 @@ async fn recalc_dims(
         }
     }
     // 重算纪录行。持有者 = 拥有最快圈的用户（DISTINCT ON 取该圈主人，非 min(user_id)）。
+    // ⚠️ 同样排除被屏蔽的圈：records 读的是 laps 而不是 best_laps，
+    //    漏了这层排除会出现"全服纪录属于一条榜上不存在的成绩"。
     let vb: Option<(i32, Uuid)> = sqlx::query_as(
-        "SELECT lap_ms, user_id FROM laps WHERE gp_index=$1 AND version_code=$2 \
-         ORDER BY lap_ms ASC, created_at ASC LIMIT 1",
+        "SELECT l.lap_ms, l.user_id FROM laps l \
+         WHERE l.gp_index=$1 AND l.version_code=$2 \
+           AND NOT EXISTS (SELECT 1 FROM hidden_missing_laps h WHERE h.lap_id=l.id) \
+         ORDER BY l.lap_ms ASC, l.created_at ASC LIMIT 1",
     )
     .bind(gp)
     .bind(ver)
     .fetch_optional(&mut **tx)
     .await?;
     let va: Option<(i32, Uuid)> = sqlx::query_as(
-        "SELECT lap_ms, user_id FROM laps WHERE gp_index=$1 \
-         ORDER BY lap_ms ASC, created_at ASC LIMIT 1",
+        "SELECT l.lap_ms, l.user_id FROM laps l \
+         WHERE l.gp_index=$1 \
+           AND NOT EXISTS (SELECT 1 FROM hidden_missing_laps h WHERE h.lap_id=l.id) \
+         ORDER BY l.lap_ms ASC, l.created_at ASC LIMIT 1",
     )
     .bind(gp)
     .fetch_optional(&mut **tx)

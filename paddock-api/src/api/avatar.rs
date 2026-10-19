@@ -174,6 +174,28 @@ pub async fn upload_avatar(
         tracing::error!("GARAGE_KEY_ID/GARAGE_SECRET 未配置，头像功能不可用");
         return Err((StatusCode::SERVICE_UNAVAILABLE, "头像服务未配置".into()));
     };
+    // 冷却检查（2026-10-20 用户定案：30 天只能换一次）。
+    // ⚠️ 检查必须在 S3 写入**之前**：先传后拒会把 Garage 里的对象换掉，
+    //    而 users.avatar_key 没更新——URL 版本号不变却指向新内容，客户端
+    //    磁盘缓存（按 URL 版本失效）会一直显示旧图，实为"上传了但不生效"。
+    let last: Option<Option<chrono::DateTime<chrono::Utc>>> =
+        sqlx::query_scalar("SELECT avatar_updated_at FROM users WHERE id = $1")
+            .bind(user_id)
+            .fetch_optional(&state.pool)
+            .await
+            .map_err(|e| {
+                tracing::error!("avatar cooldown 查询失败: {e}");
+                (StatusCode::INTERNAL_SERVER_ERROR, "服务器开小差了".into())
+            })?;
+    let remaining: i64 = crate::api::account::cooldown_remaining(last.flatten());
+    if remaining > 0 {
+        // 向上取整到天（本工具链的 Rust 版本未稳定 `div_ceil`）。
+        let days = (remaining + 86399) / 86400;
+        return Err((
+            StatusCode::TOO_MANY_REQUESTS,
+            format!("头像 30 天内只能更换一次，还需 {days} 天"),
+        ));
+    }
     let key = format!("avatars/{user_id}");
     s3_put(&cfg, &key, &content_type, &body)
         .await
@@ -181,10 +203,13 @@ pub async fn upload_avatar(
     // avatar_version = epoch millis：客户端经版本化 URL（?v=）做磁盘缓存失效，
     // 同版本 URL 不回源——VPS 流量出口优化的服务端半边。
     let version = chrono::Utc::now().timestamp_millis();
-    sqlx::query("UPDATE users SET avatar_key = $2, avatar_version = $3 WHERE id = $1")
-        .bind(user_id)
-        .bind(&key)
-        .bind(version)
+    sqlx::query(
+        "UPDATE users SET avatar_key = $2, avatar_version = $3, avatar_updated_at = now() \
+         WHERE id = $1",
+    )
+    .bind(user_id)
+    .bind(&key)
+    .bind(version)
         .execute(&state.pool)
         .await
         .map_err(|e| {

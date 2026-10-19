@@ -362,9 +362,40 @@ pub fn flags_of(
     score::AssistFlags::from(&cfg)
 }
 
+/// 「配置缺失」的**单一判据**（2026-10-20 用户定案：任一维缺失即算）。
+///
+/// 五维全齐才算完整：`pedal_mode` 一维 + TC 两维 + ABS 两维。
+///
+/// ⚠️ **为什么不能只看派生位**：`best_laps` 的四个布尔位是派生结论，
+///    `pedal_mode='off'`（原生按键）、`tc_mode='default'`（游戏默认）都会让
+///    对应位为 `false`——与「缺失」在派生位上不可区分。判「缺失」必须回到
+///    `laps` 的原始五列。
+///
+/// ⚠️ **TC/ABS 的 mode 与 strength 必须成对齐全**：`mode` 有值而 `strength`
+///    为 NULL 是管理端补录写了一半的状态，同样是「配置不全」。
+pub fn is_assist_missing(
+    pedal_mode: Option<&str>,
+    tc_mode: Option<&str>,
+    tc_strength: Option<&str>,
+    abs_mode: Option<&str>,
+    abs_strength: Option<&str>,
+) -> bool {
+    pedal_mode.is_none()
+        || tc_mode.is_none()
+        || tc_strength.is_none()
+        || abs_mode.is_none()
+        || abs_strength.is_none()
+}
+
+/// 同上，但以 SQL 布尔表达式形式返回（筛选/统计用，避免 Rust 侧拉全量回筛）。
+///
+/// 与 [`is_assist_missing`] **逐字对应**：任一列 IS NULL 即为缺失。
+/// 两处若分叉，"能不能屏蔽"的预判与实际屏蔽的行集就会不一致。
+pub const ASSIST_MISSING_SQL: &str = "(l.pedal_mode IS NULL OR l.tc_mode IS NULL \
+     OR l.tc_strength IS NULL OR l.abs_mode IS NULL OR l.abs_strength IS NULL)";
+
 /// 踏板档位 token → 展示名（管理端下拉与"配置"列共用同一张表）。
-pub const PEDAL_TOKENS: [(&str, &str); 3] =
-    [("off", "原生按键"), ("single", "单踏板"), ("dual", "双踏板")];
+pub const PEDAL_TOKENS: [(&str, &str); 3] =    [("off", "原生按键"), ("single", "单踏板"), ("dual", "双踏板")];
 
 /// TC/ABS 档位 token → 展示名。`stock` = 最高档，也代表"未开自定义（游戏默认）"。
 pub const STRENGTH_TOKENS: [(&str, &str); 5] = [
@@ -494,4 +525,68 @@ pub fn track_display_name(gp_index: i16) -> &'static str {
 
 pub fn router() -> Router<AppState> {
     Router::new().route("/laps", post(upload_lap))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_assist_missing;
+
+    /// 五维齐全 = 完整。注意 `pedal_mode=off` / `tc_mode=default` 是**有效值**，
+    /// 不是缺失——这正是"不能只看 best_laps 派生位"的原因。
+    #[test]
+    fn complete_config_is_not_missing() {
+        assert!(!is_assist_missing(
+            Some("off"),
+            Some("default"),
+            Some("stock"),
+            Some("custom"),
+            Some("off"),
+        ));
+    }
+
+    /// 任一维 NULL 即算缺失（用户定案 2026-10-20）——逐维各测一遍，
+    /// 防止将来有人把某个字段从判据里漏掉。
+    #[test]
+    fn any_null_dimension_is_missing() {
+        let full = [Some("dual"), Some("custom"), Some("weak"), Some("custom"), Some("medium")];
+        for i in 0..5 {
+            let mut v = full;
+            v[i] = None;
+            assert!(
+                is_assist_missing(v[0], v[1], v[2], v[3], v[4]),
+                "第 {i} 维为 None 时应判缺失"
+            );
+        }
+    }
+
+    /// 全缺 = 缺失（旧模块 `LapAssist.MISSING` 上报的形态）。
+    #[test]
+    fn all_null_is_missing() {
+        assert!(is_assist_missing(None, None, None, None, None));
+    }
+
+    /// 部分缺失（管理端补录写了一半）也是缺失。
+    #[test]
+    fn partial_config_is_missing() {
+        assert!(is_assist_missing(
+            Some("dual"),
+            Some("custom"),
+            None, // strength 没填
+            Some("custom"),
+            Some("off"),
+        ));
+    }
+
+    /// SQL 判据与 Rust 判据必须逐字对应：五个列名都出现在表达式里。
+    /// 两处分叉会让"预判能不能屏蔽"与实际屏蔽的行集不一致。
+    #[test]
+    fn sql_predicate_covers_all_five_columns() {
+        for col in ["pedal_mode", "tc_mode", "tc_strength", "abs_mode", "abs_strength"] {
+            assert!(
+                super::ASSIST_MISSING_SQL.contains(col),
+                "SQL 判据漏了 {col}"
+            );
+        }
+        assert_eq!(super::ASSIST_MISSING_SQL.matches("IS NULL").count(), 5);
+    }
 }
