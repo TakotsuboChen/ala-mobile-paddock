@@ -676,6 +676,12 @@ async fn hide_missing_sql(pool: &PgPool, uid: Uuid) -> i64 {
     .await
     .unwrap();
 
+    // 0) 先落开关（2026-10-20 二次定案）：重算用的判据是谓词
+    //    `AUTO_HIDDEN_SQL` = 开关打开 AND 该圈缺失，开关不先写则谓词恒假。
+    sqlx::query("UPDATE users SET hidden_missing_at = now() WHERE id=$1")
+        .bind(uid).execute(pool).await.unwrap();
+
+    // 审计记录（不参与任何判据）
     for (lap_id, _, _) in &missing {
         sqlx::query(
             "INSERT INTO hidden_missing_laps (user_id, lap_id) VALUES ($1, $2) \
@@ -693,14 +699,14 @@ async fn hide_missing_sql(pool: &PgPool, uid: Uuid) -> i64 {
             .bind(uid).bind(gp).bind(ver).execute(pool).await.unwrap();
 
         let next: Option<(i32, Option<String>, Option<String>, Option<String>, Option<String>, Option<String>)> =
-            sqlx::query_as(
+            sqlx::query_as(&format!(
                 "SELECT l.lap_ms, l.pedal_mode, l.tc_mode, l.tc_strength, l.abs_mode, l.abs_strength \
-                 FROM laps l \
+                 FROM laps l JOIN users u ON u.id = l.user_id \
                  WHERE l.user_id=$1 AND l.gp_index=$2 AND l.version_code=$3 \
-                   AND NOT EXISTS (SELECT 1 FROM hidden_missing_laps h \
-                                   WHERE h.user_id=l.user_id AND h.lap_id=l.id) \
+                   AND NOT {} \
                  ORDER BY l.lap_ms ASC, l.created_at ASC LIMIT 1",
-            )
+                crate::api::laps::AUTO_HIDDEN_SQL
+            ))
             .bind(uid).bind(gp).bind(ver).fetch_optional(pool).await.unwrap();
         if let Some((ms, pedal, tcm, tcs, absm, abss)) = next {
             let f = crate::api::laps::flags_of(
@@ -722,23 +728,25 @@ async fn hide_missing_sql(pool: &PgPool, uid: Uuid) -> i64 {
     gps.sort_unstable();
     gps.dedup();
     for gp in &gps {
-        let va: Option<(i32, Uuid)> = sqlx::query_as(
+        let va: Option<(i32, Uuid)> = sqlx::query_as(&format!(
             "SELECT l.lap_ms, l.user_id FROM laps l WHERE l.gp_index=$1 \
-               AND NOT EXISTS (SELECT 1 FROM hidden_missing_laps h WHERE h.lap_id=l.id) \
+               AND NOT EXISTS (SELECT 1 FROM users u WHERE u.id=l.user_id AND {}) \
              ORDER BY l.lap_ms ASC, l.created_at ASC LIMIT 1",
-        ).bind(gp).fetch_optional(pool).await.unwrap();
+            crate::api::laps::AUTO_HIDDEN_SQL
+        )).bind(gp).fetch_optional(pool).await.unwrap();
         apply_record_sql(pool, *gp, "alltime", 0, va).await;
 
         let versions: Vec<i32> =
             sqlx::query_scalar("SELECT DISTINCT version_code FROM laps WHERE gp_index=$1")
                 .bind(gp).fetch_all(pool).await.unwrap();
         for ver in versions {
-            let vb: Option<(i32, Uuid)> = sqlx::query_as(
+            let vb: Option<(i32, Uuid)> = sqlx::query_as(&format!(
                 "SELECT l.lap_ms, l.user_id FROM laps l \
                  WHERE l.gp_index=$1 AND l.version_code=$2 \
-                   AND NOT EXISTS (SELECT 1 FROM hidden_missing_laps h WHERE h.lap_id=l.id) \
+                   AND NOT EXISTS (SELECT 1 FROM users u WHERE u.id=l.user_id AND {}) \
                  ORDER BY l.lap_ms ASC, l.created_at ASC LIMIT 1",
-            ).bind(gp).bind(ver).fetch_optional(pool).await.unwrap();
+                crate::api::laps::AUTO_HIDDEN_SQL
+            )).bind(gp).bind(ver).fetch_optional(pool).await.unwrap();
             apply_record_sql(pool, *gp, "version", ver, vb).await;
         }
     }
@@ -864,36 +872,115 @@ async fn missing_candidate_count_matches_actual_hidden_rows() {
     wipe(&pool).await;
 }
 
-/// **快照语义**：屏蔽后新上传的缺失圈照常进榜（用户定案），不能被历史屏蔽挡住。
+/// **屏蔽 = 持续生效的开关**（2026-10-20 二次定案，替代原「快照」语义）：
+/// 补全配置后自动解除；屏蔽后新传的缺失圈自动被屏蔽。
 ///
-/// 这也是「排除条件必须用 hidden_missing_laps 的 lap_id、不能用配置判据」的
-/// 直接体现——拿「配置缺失」当过滤器会把新圈一起挡掉。
+/// 这是用户在实机报障后改的语义——快照版下管理端把配置补全了，红标仍不消失，
+/// 因为判据是 `lap_id ∈ hidden_missing_laps`，与配置状态完全解耦。
 #[tokio::test]
 #[ignore = "需要 DATABASE_URL"]
-async fn hide_missing_is_a_snapshot_new_missing_laps_still_count() {
+async fn hide_missing_is_a_switch_not_a_snapshot() {
     let Some(pool) = setup().await else { return };
     wipe(&pool).await;
     let u = mk_user(&pool, "fly3", 3).await;
 
+    // 一条缺失、一条完整
     mk_lap(&pool, u, 0, 200150, 70000, None, None, None, None, None).await;
     mk_lap(&pool, u, 0, 200150, 75000, Some("dual"), Some("custom"), Some("weak"),
            Some("custom"), Some("off")).await;
     hide_missing_sql(&pool, u).await;
+    // `mk_lap` 不返回 id（它同时写 best_laps，签名保持简单）；这里按圈速反查。
+    let missing_id: Uuid = sqlx::query_scalar(
+        "SELECT id FROM laps WHERE user_id=$1 AND gp_index=0 AND version_code=200150 AND lap_ms=70000",
+    ).bind(u).fetch_one(&pool).await.unwrap();
 
-    // 屏蔽之后新传一条更快的缺失圈（旧版模块补传的场景）
-    mk_lap(&pool, u, 0, 200150, 68000, None, None, None, None, None).await;
-
-    // 它**不是**被屏蔽的（快照里没有它的 lap_id）→ 照常参与竞争
+    // 屏蔽后：榜上是完整那条
     let best_ms: i32 = sqlx::query_scalar(
         "SELECT lap_ms FROM best_laps WHERE user_id=$1 AND gp_index=0 AND version_code=200150",
     ).bind(u).fetch_one(&pool).await.unwrap();
-    assert_eq!(best_ms, 68000, "新上传的缺失圈不在快照里，照常进榜");
+    assert_eq!(best_ms, 75000, "屏蔽后榜上只能是完整配置的那条");
 
-    let hidden: bool = sqlx::query_scalar(
-        "SELECT EXISTS (SELECT 1 FROM hidden_missing_laps h JOIN laps l ON l.id=h.lap_id \
-         WHERE h.user_id=$1 AND l.lap_ms=68000)",
+    // ── 场景 1：管理端把缺失那条补全 → 重算后**自动解除屏蔽并回榜** ──
+    // 补全成比现最佳更快的配置完整圈
+    sqlx::query(
+        "UPDATE laps SET pedal_mode='dual', tc_mode='custom', tc_strength='off', \
+                         abs_mode='custom', abs_strength='off' WHERE id=$1",
+    ).bind(missing_id).execute(&pool).await.unwrap();
+    recalc_dims_sql(&pool, u, 0, 200150).await;
+
+    let best_ms: i32 = sqlx::query_scalar(
+        "SELECT lap_ms FROM best_laps WHERE user_id=$1 AND gp_index=0 AND version_code=200150",
     ).bind(u).fetch_one(&pool).await.unwrap();
-    assert!(!hidden, "新圈不得被自动标记为已屏蔽");
+    assert_eq!(best_ms, 70000, "补全配置后自动解除屏蔽，该圈重新成为最佳");
+
+    // 红标判据（谓词）此时也必须为假
+    let still_hidden: bool = sqlx::query_scalar(&format!(
+        "SELECT EXISTS (SELECT 1 FROM laps l JOIN users u ON u.id=l.user_id \
+         WHERE l.id=$1 AND {})",
+        crate::api::laps::AUTO_HIDDEN_SQL
+    )).bind(missing_id).fetch_one(&pool).await.unwrap();
+    assert!(!still_hidden, "配置已完整 → 谓词为假 → 不再显示「已屏蔽」");
+
+    // ── 场景 2：屏蔽之后新传一条缺失圈 → 自动被屏蔽，不进榜 ──
+    mk_lap(&pool, u, 1, 200150, 60000, None, None, None, None, None).await;
+    recalc_dims_sql(&pool, u, 1, 200150).await;
+    let gp1_best: Option<i32> = sqlx::query_scalar(
+        "SELECT lap_ms FROM best_laps WHERE user_id=$1 AND gp_index=1 AND version_code=200150",
+    ).bind(u).fetch_optional(&pool).await.unwrap();
+    assert_eq!(gp1_best, None, "开关打开期间，新传的缺失圈自动被屏蔽（不进榜）");
 
     wipe(&pool).await;
+}
+
+/// 复刻 `admin::recalc_dims` 的 best_laps + records 重算（判据同源）。
+async fn recalc_dims_sql(pool: &PgPool, uid: Uuid, gp: i16, ver: i32) {
+    let ub: Option<(i32, Option<String>, Option<String>, Option<String>, Option<String>, Option<String>)> =
+        sqlx::query_as(&format!(
+            "SELECT l.lap_ms, l.pedal_mode, l.tc_mode, l.tc_strength, l.abs_mode, l.abs_strength \
+             FROM laps l JOIN users u ON u.id = l.user_id \
+             WHERE l.user_id=$1 AND l.gp_index=$2 AND l.version_code=$3 \
+               AND NOT {} \
+             ORDER BY l.lap_ms ASC, l.created_at ASC LIMIT 1",
+            crate::api::laps::AUTO_HIDDEN_SQL
+        ))
+        .bind(uid).bind(gp).bind(ver).fetch_optional(pool).await.unwrap();
+    match ub {
+        Some((ms, pedal, tcm, tcs, absm, abss)) => {
+            let f = crate::api::laps::flags_of(
+                pedal.as_deref(), tcm.as_deref(), tcs.as_deref(),
+                absm.as_deref(), abss.as_deref(),
+            );
+            sqlx::query(
+                "INSERT INTO best_laps (user_id, gp_index, version_code, lap_ms, \
+                                        pedal_linear, tc_off, abs_off, abs_low) \
+                 VALUES ($1,$2,$3,$4,$5,$6,$7,$8) \
+                 ON CONFLICT (user_id, gp_index, version_code) \
+                 DO UPDATE SET lap_ms=EXCLUDED.lap_ms, updated_at=now(), \
+                               pedal_linear=EXCLUDED.pedal_linear, tc_off=EXCLUDED.tc_off, \
+                               abs_off=EXCLUDED.abs_off, abs_low=EXCLUDED.abs_low",
+            )
+            .bind(uid).bind(gp).bind(ver).bind(ms)
+            .bind(f.pedal_linear).bind(f.tc_off).bind(f.abs_off).bind(f.abs_low)
+            .execute(pool).await.unwrap();
+        }
+        None => {
+            sqlx::query("DELETE FROM best_laps WHERE user_id=$1 AND gp_index=$2 AND version_code=$3")
+                .bind(uid).bind(gp).bind(ver).execute(pool).await.unwrap();
+        }
+    }
+    let vb: Option<(i32, Uuid)> = sqlx::query_as(&format!(
+        "SELECT l.lap_ms, l.user_id FROM laps l \
+         WHERE l.gp_index=$1 AND l.version_code=$2 \
+           AND NOT EXISTS (SELECT 1 FROM users u WHERE u.id=l.user_id AND {}) \
+         ORDER BY l.lap_ms ASC, l.created_at ASC LIMIT 1",
+        crate::api::laps::AUTO_HIDDEN_SQL
+    )).bind(gp).bind(ver).fetch_optional(pool).await.unwrap();
+    let va: Option<(i32, Uuid)> = sqlx::query_as(&format!(
+        "SELECT l.lap_ms, l.user_id FROM laps l WHERE l.gp_index=$1 \
+           AND NOT EXISTS (SELECT 1 FROM users u WHERE u.id=l.user_id AND {}) \
+         ORDER BY l.lap_ms ASC, l.created_at ASC LIMIT 1",
+        crate::api::laps::AUTO_HIDDEN_SQL
+    )).bind(gp).fetch_optional(pool).await.unwrap();
+    apply_record_sql(pool, gp, "alltime", 0, va).await;
+    apply_record_sql(pool, gp, "version", ver, vb).await;
 }

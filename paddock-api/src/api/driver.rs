@@ -291,10 +291,10 @@ pub async fn driver_page(
                 EXISTS (SELECT 1 FROM best_laps b3 WHERE b3.user_id=l.user_id \
                   AND b3.gp_index=l.gp_index AND b3.version_code=l.version_code \
                   AND b3.lap_ms=l.lap_ms) AS personal_best, \
-                EXISTS (SELECT 1 FROM hidden_missing_laps h \
-                  WHERE h.user_id=l.user_id AND h.lap_id=l.id) AS hidden \
+                EXISTS (SELECT 1 FROM users u WHERE u.id=l.user_id AND {}) AS hidden \
          FROM laps l WHERE {where_sql} \
-         ORDER BY {order_by} LIMIT ${limit_ph} OFFSET ${offset_ph}"
+         ORDER BY {order_by} LIMIT ${limit_ph} OFFSET ${offset_ph}",
+        crate::api::laps::AUTO_HIDDEN_SQL
     );
 
     // ⚠️ `personal_best` 与 `hidden` 的互斥性在 Rust 侧强制，而不是只靠 UI 的
@@ -303,6 +303,11 @@ pub async fn driver_page(
     //    best_laps，则两条都会命中 lap_ms 相等——被屏蔽那条会同时带两个标。
     //    这里直接清掉 personal_best，让"已屏蔽 = 不在榜上"成为数据事实。
     //    客户端因此可以无条件先判 hidden，不必依赖 if/else 顺序。
+    //
+    // ⚠️ 红标判据 = [`laps::AUTO_HIDDEN_SQL`]（2026-10-20 二次定案）：屏蔽是
+    //    **持续生效的开关**，不是点击当时的快照。补全配置即自动解除，之后新传
+    //    的缺失圈自动被屏蔽。不要再改回 `hidden_missing_laps` 的 lap_id 匹配——
+    //    那样配置补全后红标永远不消失（实机报障的根因）。
 
     // 绑定顺序必须与占位符序号一致。
     let mut cq = sqlx::query_scalar::<_, i64>(&count_sql).bind(user_id);

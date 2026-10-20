@@ -88,6 +88,47 @@ pub async fn upload_lap(
     .execute(&mut *tx)
     .await?;
 
+    // 1.5) **自动屏蔽闸门**（2026-10-20 二次定案）。
+    //      用户开启过屏蔽（`hidden_missing_at IS NOT NULL`）且本圈配置缺失
+    //      ⇒ 本圈按 [`AUTO_HIDDEN_SQL`] 属于「应被屏蔽」，**不得进入 best_laps /
+    //      records**。laps 全量留档照常（1) 已写），这样管理端补全配置后，
+    //      下次 recalc_dims 重算时谓词变假，本圈自动回榜——两条路径共用同一判据。
+    //
+    //      ⚠️ 必须在这里拦，不能只在重算路径拦：屏蔽时 best_laps 行已被删除，
+    //         下面的 `UPDATE ... WHERE lap_ms > $4` 会命中 0 行并走 insert 分支，
+    //         那条路径不看任何屏蔽判据，会把圈直接插回榜单。
+    //
+    //      判据同源：配置侧走 Rust 版 [`is_assist_missing`]（与 SQL 版
+    //      `ASSIST_MISSING_SQL` 由单元测试锁死逐字对应），开关侧查 users。
+    let hidden_switch: bool = sqlx::query_scalar(
+        "SELECT hidden_missing_at IS NOT NULL FROM users WHERE id=$1",
+    )
+    .bind(user_id)
+    .fetch_one(&mut *tx)
+    .await?;
+    let auto_hidden = hidden_switch
+        && is_assist_missing(
+            assist.pedal_mode.as_deref(),
+            assist.tc_mode.as_deref(),
+            assist.tc_strength.as_deref(),
+            assist.abs_mode.as_deref(),
+            assist.abs_strength.as_deref(),
+        );
+    if auto_hidden {
+        tx.commit().await?;
+        tracing::debug!(
+            "user {user_id} auto-hid missing-config lap gp={} ver={} ms={}",
+            lap.gp_index,
+            lap.version_code,
+            lap.lap_ms
+        );
+        return Ok(Json(LapUploadResp {
+            personal_best: false,
+            server_best: false,
+            toast: None,
+        }));
+    }
+
     // 2) 个人版本最佳（best_laps：每人每赛道每版本一条）
     //    ⚠️ 配置列必须与 lap_ms 同期更新——否则"刷新个人纪录"后榜上挂着
     //    上一条圈的旧配置，金标与加成都算错。两者同属"这条圈的事实"。
@@ -373,10 +414,10 @@ pub fn flags_of(
 ///
 /// ⚠️ **TC/ABS 的 mode 与 strength 必须成对齐全**：`mode` 有值而 `strength`
 ///    为 NULL 是管理端补录写了一半的状态，同样是「配置不全」。
-/// ⚠️ **生产路径不调用它**：屏蔽/统计都走 [`ASSIST_MISSING_SQL`]（避免把全量圈
-///    拉回 Rust 侧回筛）。保留 Rust 版是为了给 SQL 表达式当**语义锚点**——
-///    `tests::sql_predicate_covers_all_five_columns` 靠它保证两者不会分叉。
-#[allow(dead_code)]
+///
+/// **调用方**：`upload_lap` 的自动屏蔽闸门（2026-10-20）——那里手上就是五维
+/// `Option<&str>`，走 SQL 反而要再查一次库。其余统计/筛选用 [`ASSIST_MISSING_SQL`]。
+/// 两版由 `tests::sql_predicate_covers_all_five_columns` 锁死逐字对应。
 pub fn is_assist_missing(
     pedal_mode: Option<&str>,
     tc_mode: Option<&str>,
@@ -397,6 +438,38 @@ pub fn is_assist_missing(
 /// 两处若分叉，"能不能屏蔽"的预判与实际屏蔽的行集就会不一致。
 pub const ASSIST_MISSING_SQL: &str = "(l.pedal_mode IS NULL OR l.tc_mode IS NULL \
      OR l.tc_strength IS NULL OR l.abs_mode IS NULL OR l.abs_strength IS NULL)";
+
+/// 「该圈此刻应被自动屏蔽」的 SQL 谓词 —— **屏蔽判据的唯一事实源**。
+///
+/// ## 语义（2026-10-20 二次定案：从「快照」升级为「持续生效的开关」）
+///
+/// 用户开启屏蔽后，`users.hidden_missing_at` 就是那个开关；**开关打开期间，
+/// 配置缺失的圈一律被屏蔽**，与它是什么时候上传的无关：
+///
+/// - 补全配置 → 谓词变假 → **自动解除**（管理端编辑保存即生效）；
+/// - 之后旧版模块再传缺失圈 → 谓词为真 → **自动屏蔽**（用户定案原话）。
+///
+/// 首版是「快照」语义（按 `lap_id` 记进 `hidden_missing_laps`，屏蔽后新传的
+/// 缺失圈照常进榜）。用户在实机看到「管理端补全配置后红标不消失」后改为本条，
+/// 因为快照语义下屏蔽状态与配置**永久解耦**，任何一侧变化都不会互相影响。
+///
+/// ## 为什么是谓词而不是表
+///
+/// 谓词天然对"配置变化"和"新圈上传"两个方向都即时生效，不需要在每条写入
+/// 路径上手工维护一份状态表。`hidden_missing_laps` 因此降级为**纯审计记录**
+/// （谁在哪一刻屏蔽了哪些圈），不再参与任何判据。
+///
+/// ## 用法
+///
+/// 需要 `laps l` 与 `users u` 同时在 FROM 里（JOIN 或子查询），且 `u.id = l.user_id`。
+/// 列表查询里 `l.user_id` 就是本人，故写成相关子查询也成立：
+///
+/// ```sql
+/// EXISTS (SELECT 1 FROM users u WHERE u.id = l.user_id AND {AUTO_HIDDEN_SQL})
+/// ```
+pub const AUTO_HIDDEN_SQL: &str = "(u.hidden_missing_at IS NOT NULL AND \
+     (l.pedal_mode IS NULL OR l.tc_mode IS NULL OR l.tc_strength IS NULL \
+      OR l.abs_mode IS NULL OR l.abs_strength IS NULL))";
 
 /// 踏板档位 token → 展示名（管理端下拉与"配置"列共用同一张表）。
 pub const PEDAL_TOKENS: [(&str, &str); 3] =    [("off", "原生按键"), ("single", "单踏板"), ("dual", "双踏板")];

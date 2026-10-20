@@ -11,16 +11,20 @@
 //! ## 为什么屏蔽要重算 best_laps 而不是加过滤条件
 //!
 //! 积分/排名/金标全部以 `best_laps` 为数据源（`score.rs::scored_cte` 是唯一窗口
-//! 定义）。在榜单 SQL 里加 `NOT EXISTS (hidden_missing_laps)` 意味着**每一处**
-//! 用到 best_laps 的地方都要加一遍（版本榜/总榜/`/v1/me`/车手主页/管理端），
-//! 漏一处就是"榜上看不到但积分还在"。删除行则让所有下游自动一致。
+//! 定义）。在榜单 SQL 里加屏蔽过滤条件意味着**每一处**用到 best_laps 的地方都要
+//! 加一遍（版本榜/总榜/`/v1/me`/车手主页/管理端），漏一处就是"榜上看不到但积分
+//! 还在"。删除行则让所有下游自动一致。
 //!
-//! ## 为什么重算要用"排除被屏蔽 lap_id"而不是简单删行
+//! ## 为什么重算要"排除应被屏蔽的圈"而不是简单删行
 //!
 //! 屏蔽后 `best_laps` 该维度被删，但该用户在**同一维度**可能还有别的圈
 //! （正常圈或另一条缺失圈）。用户定案「屏蔽 = 这些成绩不存在」，故重算时
-//! 必须把被屏蔽的圈排除后重新取最快——否则一条比被屏蔽圈更慢的正常圈
+//! 必须把应被屏蔽的圈排除后重新取最快——否则一条比被屏蔽圈更慢的正常圈
 //! 永远上不了榜（维度被删后没有触发路径）。
+//!
+//! 「应被屏蔽」的判据是 [`laps::AUTO_HIDDEN_SQL`]（开关打开 AND 该圈配置缺失），
+//! 不是 `hidden_missing_laps` 的 lap_id 匹配——后者是快照语义，配置补全后
+//! 永远解除不了（2026-10-20 实机报障根因）。
 //!
 //! ⚠️ **records（全服最快圈）也要一并重算**：被屏蔽的圈若持有赛道纪录，
 //!    删掉 best_laps 行不影响 records（它读 laps），会出现"纪录属于一个
@@ -207,10 +211,22 @@ pub struct HideMissingResp {
 
 /// POST /v1/me/hide-missing（Bearer）
 ///
-/// 一次性、不可撤销（用户定案 2026-10-20）。语义 = 「这些成绩不存在」：
-/// 1. 把该用户**全部**配置缺失的圈记进 `hidden_missing_laps`（按 lap_id，快照语义）；
-/// 2. 对这些圈涉及的每个 (赛道, 版本) 维度重算 `best_laps`（排除已屏蔽的圈）；
-/// 3. 重算受影响赛道的 `records`。
+/// 一次性、不可撤销（用户定案 2026-10-20）。语义 = 「配置缺失的成绩不算数」：
+/// 1. 落开关 `users.hidden_missing_at`（**必须先于任何重算**，见步骤 0）；
+/// 2. 把当前全部缺失圈记进 `hidden_missing_laps` —— **纯审计记录**，不参与判据；
+/// 3. 对这些圈涉及的每个 (赛道, 版本) 维度重算 `best_laps`；
+/// 4. 重算受影响赛道的 `records`。
+///
+/// ## 屏蔽判据是谓词，不是快照（2026-10-20 二次定案）
+///
+/// 判据 = [`laps::AUTO_HIDDEN_SQL`]：「开关打开」且「该圈配置缺失」。
+/// 因此本端点只是**打开开关**，而开关的效果是持续生效的：
+/// - 管理端补全某条圈的配置 → 谓词变假 → 该圈**自动解除屏蔽并回到榜单**；
+/// - 之后旧版模块再上传缺失圈 → 谓词为真 → **自动被屏蔽**。
+///
+/// 首版是快照语义（只处理点击当时那批圈，新圈照常进榜），实机报障为
+/// 「管理端补全配置后红标仍不消失」——快照与配置永久解耦，任何一侧变化都
+/// 不会互相影响。`hidden_missing_laps` 因此降级为审计表。
 ///
 /// ⚠️ **范围 = 全部缺失圈，不是「每维度获胜圈」**（2026-10-20 修正）：
 ///    首版用 `DISTINCT ON (gp_index, version_code)` 只取每维度最快的圈，结果
@@ -219,7 +235,7 @@ pub struct HideMissingResp {
 ///    用户看到「只有少部分显示已屏蔽，还有一堆没屏蔽，缺失配置的还显示最佳」。
 ///    实机数据：飞行雪绒 65 条缺失圈只标了 7 条（= 7 个维度的获胜圈）。
 ///
-/// ⚠️ 第 2 步对**受影响维度无条件重算**，不判「获胜圈是否被屏蔽」：
+/// ⚠️ 第 3 步对**受影响维度无条件重算**，不判「获胜圈是否被屏蔽」：
 ///    回放口径与获胜圈口径一致（`lap_ms ASC, created_at ASC LIMIT 1`），若获胜圈
 ///    未被屏蔽，回放会选出同一行，结果不变。少一个分支就少一处口径分叉。
 pub async fn hide_missing(
@@ -244,6 +260,16 @@ pub async fn hide_missing(
         }
         Some(None) => {}
     }
+
+    // 0) **先落开关，再重算**（2026-10-20 二次定案，顺序不可颠倒）。
+    //    屏蔽判据已升级为谓词 `laps::AUTO_HIDDEN_SQL` =
+    //    「`hidden_missing_at IS NOT NULL` 且该圈配置缺失」——重算时用的就是它。
+    //    若像首版那样把标记放在最后写，下面所有回放查到的开关都还是 NULL，
+    //    谓词恒假 ⇒ 一条都排除不掉，屏蔽等于没做。
+    sqlx::query("UPDATE users SET hidden_missing_at = now() WHERE id = $1")
+        .bind(user_id)
+        .execute(&mut *tx)
+        .await?;
 
     // 1) 该用户全部配置缺失的圈。判据走 `laps::ASSIST_MISSING_SQL`（单一事实源），
     //    与 `count_missing_candidates` 同源——预判"有没有可屏蔽的"与实际屏蔽的行集
@@ -286,9 +312,10 @@ pub async fn hide_missing(
     dims.sort_unstable();
     dims.dedup();
 
-    // 4) 从剩余圈回放 best_laps：排除已屏蔽的 lap_id，取最快的一条。
-    //    ⚠️ 排除条件必须用 hidden_missing_laps 而不是"配置完整"——屏蔽是快照，
-    //       屏蔽后新上传的缺失圈照常进榜（用户定案），不能拿配置判据当过滤器。
+    // 4) 从剩余圈回放 best_laps：排除「开关打开且该圈缺失」的圈，取最快的一条。
+    //    ⚠️ 排除条件 = [`laps::AUTO_HIDDEN_SQL`]（单一事实源），不是 `hidden_missing_laps`
+    //       的 lap_id 匹配——后者是快照语义，配置补全后永远解除不了（实机报障根因）。
+    //       谓词语义下「配置完整」的圈天然不被排除，补全后自动回榜。
     //    ⚠️ 先 DELETE 再回放（而不是直接 upsert）：若该维度屏蔽后已无可用圈，
     //       必须让 best_laps 行消失。回放命中时再 upsert 回来。
     for (gp, ver) in &dims {
@@ -300,14 +327,14 @@ pub async fn hide_missing(
             .await?;
 
         let next: Option<(i32, Option<String>, Option<String>, Option<String>, Option<String>, Option<String>)> =
-            sqlx::query_as(
+            sqlx::query_as(&format!(
                 "SELECT l.lap_ms, l.pedal_mode, l.tc_mode, l.tc_strength, l.abs_mode, l.abs_strength \
-                 FROM laps l \
+                 FROM laps l JOIN users u ON u.id = l.user_id \
                  WHERE l.user_id=$1 AND l.gp_index=$2 AND l.version_code=$3 \
-                   AND NOT EXISTS (SELECT 1 FROM hidden_missing_laps h \
-                                   WHERE h.user_id=l.user_id AND h.lap_id=l.id) \
+                   AND NOT {} \
                  ORDER BY l.lap_ms ASC, l.created_at ASC LIMIT 1",
-            )
+                laps::AUTO_HIDDEN_SQL
+            ))
             .bind(user_id)
             .bind(gp)
             .bind(ver)
@@ -341,17 +368,19 @@ pub async fn hide_missing(
     }
 
     // 5) 重算 records：被屏蔽的圈可能持有全服纪录，必须让位给下一个最快圈。
-    //    口径与 admin::recalc_dims 相同，额外排除所有被屏蔽的 lap_id。
+    //    口径与 admin::recalc_dims 相同，按 [`laps::AUTO_HIDDEN_SQL`] 排除。
+    //    注意这些查询跨**全部用户**，故用相关子查询取该圈主人的开关状态。
     let mut affected_gps: Vec<i16> = dims.iter().map(|(gp, _)| *gp).collect();
     affected_gps.sort_unstable();
     affected_gps.dedup();
 
     for gp in &affected_gps {
-        let va: Option<(i32, Uuid)> = sqlx::query_as(
+        let va: Option<(i32, Uuid)> = sqlx::query_as(&format!(
             "SELECT l.lap_ms, l.user_id FROM laps l WHERE l.gp_index=$1 \
-               AND NOT EXISTS (SELECT 1 FROM hidden_missing_laps h WHERE h.lap_id=l.id) \
+               AND NOT EXISTS (SELECT 1 FROM users u WHERE u.id=l.user_id AND {}) \
              ORDER BY l.lap_ms ASC, l.created_at ASC LIMIT 1",
-        )
+            laps::AUTO_HIDDEN_SQL
+        ))
         .bind(gp)
         .fetch_optional(&mut *tx)
         .await?;
@@ -365,12 +394,13 @@ pub async fn hide_missing(
         .fetch_all(&mut *tx)
         .await?;
         for ver in versions {
-            let vb: Option<(i32, Uuid)> = sqlx::query_as(
+            let vb: Option<(i32, Uuid)> = sqlx::query_as(&format!(
                 "SELECT l.lap_ms, l.user_id FROM laps l \
                  WHERE l.gp_index=$1 AND l.version_code=$2 \
-                   AND NOT EXISTS (SELECT 1 FROM hidden_missing_laps h WHERE h.lap_id=l.id) \
+                   AND NOT EXISTS (SELECT 1 FROM users u WHERE u.id=l.user_id AND {}) \
                  ORDER BY l.lap_ms ASC, l.created_at ASC LIMIT 1",
-            )
+                laps::AUTO_HIDDEN_SQL
+            ))
             .bind(gp)
             .bind(ver)
             .fetch_optional(&mut *tx)
@@ -378,12 +408,6 @@ pub async fn hide_missing(
             apply_record(&mut tx, *gp, "version", ver, vb).await?;
         }
     }
-
-    // 6) 落标记（决定后续请求直接返回"已屏蔽过"）
-    sqlx::query("UPDATE users SET hidden_missing_at = now() WHERE id = $1")
-        .bind(user_id)
-        .execute(&mut *tx)
-        .await?;
 
     tx.commit().await?;
     tracing::info!(
