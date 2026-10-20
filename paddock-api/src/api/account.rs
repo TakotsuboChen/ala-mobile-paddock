@@ -55,8 +55,10 @@ pub struct AccountState {
     pub hidden_missing: bool,
     /// 当前是否**存在**可屏蔽的缺失配置记录（false → 弹「没有可屏蔽的记录」）
     ///
-    /// 口径 = `best_laps` 行对应的获胜圈五维有缺失。**只看榜上的行**：
-    /// 已经不在榜上的圈（被屏蔽过/不是个人最佳）没有可屏蔽的东西。
+    /// 口径 = 该用户 `laps` 里**任意一条**五维有缺失的圈（2026-10-20 修正）。
+    /// ⚠️ 早期口径是「榜上获胜圈缺失的维度数 > 0」——那会让「维度里最快的圈配置
+    ///    完整、次快圈缺失」的用户被判成"无可屏蔽记录"，与屏蔽动作实际要处理的
+    ///    范围（全部缺失圈）不一致。判据必须与 `hide_missing` 的选取集合同源。
     pub has_hidden_candidates: bool,
 }
 
@@ -109,24 +111,18 @@ pub fn cooldown_remaining(at: Option<chrono::DateTime<chrono::Utc>>) -> i64 {
     }
 }
 
-/// 可屏蔽记录数 = 榜上（best_laps）获胜圈五维有缺失的维度数。
+/// 可屏蔽记录数 = 该用户配置缺失的圈数。
+///
+/// ⚠️ **判据必须与 [`hide_missing`] 的选取集合同源**（2026-10-20 修正）：
+///    早期这里算的是「榜上获胜圈缺失的维度数」，而 `hide_missing` 也只屏蔽获胜圈，
+///    两者一致但**范围都错了**——用户点「屏蔽」时看到 65 条缺失圈里只标了 7 条，
+///    被屏蔽的获胜圈由下一条同样缺失的圈接棒，于是「缺失」与「最佳」同挂一条。
+///    现在两处统一为「该用户全部缺失圈」。
 async fn count_missing_candidates(state: &AppState, user_id: Uuid) -> Result<i64, ApiError> {
-    // ⚠️ 必须 JOIN 回 laps 拿原始五列：best_laps 只有派生布尔位，无法区分
-    //    「缺失」与「原生按键 / 游戏默认」（见 laps::is_assist_missing 注释）。
-    //    `ORDER BY lap_ms ASC, created_at ASC LIMIT 1` 与 admin::recalc_dims
-    //    取获胜圈的口径逐字一致——两处口径分叉会算出不同的"获胜圈"。
+    // 判据只有一份定义（`laps::ASSIST_MISSING_SQL`），这里把前缀换成 l.
     let sql = format!(
-        "SELECT count(*)::bigint FROM ( \
-           SELECT DISTINCT ON (l.user_id, l.gp_index, l.version_code) \
-                  l.pedal_mode, l.tc_mode, l.tc_strength, l.abs_mode, l.abs_strength \
-           FROM laps l \
-           WHERE l.user_id = $1 \
-           ORDER BY l.user_id, l.gp_index, l.version_code, l.lap_ms ASC, l.created_at ASC \
-         ) w \
-         WHERE {}",
-        // 别名前缀换成 w.：上面的子查询把列名原样带出，但 `ASSIST_MISSING_SQL`
-        // 写死了 `l.` 前缀。这里做一次前缀替换，保证判据只有一份定义。
-        laps::ASSIST_MISSING_SQL.replace("l.", "w.")
+        "SELECT count(*)::bigint FROM laps l WHERE l.user_id = $1 AND {}",
+        laps::ASSIST_MISSING_SQL
     );
     let n: i64 = sqlx::query_scalar(&sql)
         .bind(user_id)
@@ -212,11 +208,20 @@ pub struct HideMissingResp {
 /// POST /v1/me/hide-missing（Bearer）
 ///
 /// 一次性、不可撤销（用户定案 2026-10-20）。语义 = 「这些成绩不存在」：
-/// 1. 把该用户**榜上获胜圈配置缺失**的每个 (赛道, 版本) 维度的获胜圈记进
-///    `hidden_missing_laps`（按 lap_id，快照语义）；
-/// 2. 从 `best_laps` 删除这些维度；
-/// 3. 从剩余圈里重算这些维度的 best_laps（排除已屏蔽的圈）；
-/// 4. 重算受影响赛道的 `records`。
+/// 1. 把该用户**全部**配置缺失的圈记进 `hidden_missing_laps`（按 lap_id，快照语义）；
+/// 2. 对这些圈涉及的每个 (赛道, 版本) 维度重算 `best_laps`（排除已屏蔽的圈）；
+/// 3. 重算受影响赛道的 `records`。
+///
+/// ⚠️ **范围 = 全部缺失圈，不是「每维度获胜圈」**（2026-10-20 修正）：
+///    首版用 `DISTINCT ON (gp_index, version_code)` 只取每维度最快的圈，结果
+///    每维度最多屏蔽 1 条；被屏蔽的获胜圈移出 `best_laps` 后，回放会挑**下一条
+///    最快的圈**顶上——而它往往同样缺失配置，于是「缺失」与「最佳」同挂一条记录，
+///    用户看到「只有少部分显示已屏蔽，还有一堆没屏蔽，缺失配置的还显示最佳」。
+///    实机数据：飞行雪绒 65 条缺失圈只标了 7 条（= 7 个维度的获胜圈）。
+///
+/// ⚠️ 第 2 步对**受影响维度无条件重算**，不判「获胜圈是否被屏蔽」：
+///    回放口径与获胜圈口径一致（`lap_ms ASC, created_at ASC LIMIT 1`），若获胜圈
+///    未被屏蔽，回放会选出同一行，结果不变。少一个分支就少一处口径分叉。
 pub async fn hide_missing(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -240,76 +245,60 @@ pub async fn hide_missing(
         Some(None) => {}
     }
 
-    // 1) 找出每个维度当前的获胜圈（口径与 admin::recalc_dims 逐字一致）。
-    //    这里取全部维度的获胜圈，再在 Rust 侧筛「配置缺失」——比把判据拼进
-    //    SQL 更直白，且维度数上限 = 16 赛道 × 版本数，量级极小。
+    // 1) 该用户全部配置缺失的圈。判据走 `laps::ASSIST_MISSING_SQL`（单一事实源），
+    //    与 `count_missing_candidates` 同源——预判"有没有可屏蔽的"与实际屏蔽的行集
+    //    必须一致，否则用户会看到「有候选」→ 点了却报「没有可屏蔽的记录」。
     #[derive(sqlx::FromRow)]
-    struct Winner {
-        lap_id: Uuid,
+    struct MissingLap {
+        id: Uuid,
         gp_index: i16,
         version_code: i32,
-        pedal_mode: Option<String>,
-        tc_mode: Option<String>,
-        tc_strength: Option<String>,
-        abs_mode: Option<String>,
-        abs_strength: Option<String>,
     }
-    let winners: Vec<Winner> = sqlx::query_as(
-        "SELECT DISTINCT ON (l.gp_index, l.version_code) \
-                l.id AS lap_id, l.gp_index, l.version_code, \
-                l.pedal_mode, l.tc_mode, l.tc_strength, l.abs_mode, l.abs_strength \
-         FROM laps l WHERE l.user_id = $1 \
-         ORDER BY l.gp_index, l.version_code, l.lap_ms ASC, l.created_at ASC",
-    )
+    let missing: Vec<MissingLap> = sqlx::query_as(&format!(
+        "SELECT l.id, l.gp_index, l.version_code FROM laps l \
+         WHERE l.user_id = $1 AND {}",
+        laps::ASSIST_MISSING_SQL
+    ))
     .bind(user_id)
     .fetch_all(&mut *tx)
     .await?;
 
-    let targets: Vec<&Winner> = winners
-        .iter()
-        .filter(|w| {
-            laps::is_assist_missing(
-                w.pedal_mode.as_deref(),
-                w.tc_mode.as_deref(),
-                w.tc_strength.as_deref(),
-                w.abs_mode.as_deref(),
-                w.abs_strength.as_deref(),
-            )
-        })
-        .collect();
-
-    if targets.is_empty() {
+    if missing.is_empty() {
         return Err(ApiError::bad_request("您没有可以屏蔽的圈速记录"));
     }
 
-    // 2) 记快照 + 删 best_laps 行。ON CONFLICT DO NOTHING 防御性写法：
-    //    正常路径下这些行不可能已存在（隐藏过就早返回了）。
-    for w in &targets {
+    // 2) 记快照。ON CONFLICT DO NOTHING 防御性写法：正常路径下这些行不可能已存在
+    //    （屏蔽过就早返回了），但**重复执行本函数的修复脚本**需要它幂等。
+    for m in &missing {
         sqlx::query(
             "INSERT INTO hidden_missing_laps (user_id, lap_id) VALUES ($1, $2) \
              ON CONFLICT (user_id, lap_id) DO NOTHING",
         )
         .bind(user_id)
-        .bind(w.lap_id)
+        .bind(m.id)
         .execute(&mut *tx)
         .await?;
-        sqlx::query("DELETE FROM best_laps WHERE user_id=$1 AND gp_index=$2 AND version_code=$3")
-            .bind(user_id)
-            .bind(w.gp_index)
-            .bind(w.version_code)
-            .execute(&mut *tx)
-            .await?;
     }
 
-    // 3) 受影响赛道集合（records 重算用）
-    let mut affected_gps: Vec<i16> = targets.iter().map(|w| w.gp_index).collect();
-    affected_gps.sort_unstable();
-    affected_gps.dedup();
+    // 3) 受影响维度集合。同一维度可能有多条缺失圈，必须去重——否则会对同一
+    //    维度反复删/插 best_laps（结果相同但白跑 N 次查询）。
+    let mut dims: Vec<(i16, i32)> = missing.iter().map(|m| (m.gp_index, m.version_code)).collect();
+    dims.sort_unstable();
+    dims.dedup();
 
     // 4) 从剩余圈回放 best_laps：排除已屏蔽的 lap_id，取最快的一条。
     //    ⚠️ 排除条件必须用 hidden_missing_laps 而不是"配置完整"——屏蔽是快照，
     //       屏蔽后新上传的缺失圈照常进榜（用户定案），不能拿配置判据当过滤器。
-    for w in &targets {
+    //    ⚠️ 先 DELETE 再回放（而不是直接 upsert）：若该维度屏蔽后已无可用圈，
+    //       必须让 best_laps 行消失。回放命中时再 upsert 回来。
+    for (gp, ver) in &dims {
+        sqlx::query("DELETE FROM best_laps WHERE user_id=$1 AND gp_index=$2 AND version_code=$3")
+            .bind(user_id)
+            .bind(gp)
+            .bind(ver)
+            .execute(&mut *tx)
+            .await?;
+
         let next: Option<(i32, Option<String>, Option<String>, Option<String>, Option<String>, Option<String>)> =
             sqlx::query_as(
                 "SELECT l.lap_ms, l.pedal_mode, l.tc_mode, l.tc_strength, l.abs_mode, l.abs_strength \
@@ -320,8 +309,8 @@ pub async fn hide_missing(
                  ORDER BY l.lap_ms ASC, l.created_at ASC LIMIT 1",
             )
             .bind(user_id)
-            .bind(w.gp_index)
-            .bind(w.version_code)
+            .bind(gp)
+            .bind(ver)
             .fetch_optional(&mut *tx)
             .await?;
         if let Some((ms, pedal, tcm, tcs, absm, abss)) = next {
@@ -335,15 +324,11 @@ pub async fn hide_missing(
             sqlx::query(
                 "INSERT INTO best_laps (user_id, gp_index, version_code, lap_ms, \
                                         pedal_linear, tc_off, abs_off, abs_low) \
-                 VALUES ($1,$2,$3,$4,$5,$6,$7,$8) \
-                 ON CONFLICT (user_id, gp_index, version_code) \
-                 DO UPDATE SET lap_ms=EXCLUDED.lap_ms, updated_at=now(), \
-                               pedal_linear=EXCLUDED.pedal_linear, tc_off=EXCLUDED.tc_off, \
-                               abs_off=EXCLUDED.abs_off, abs_low=EXCLUDED.abs_low",
+                 VALUES ($1,$2,$3,$4,$5,$6,$7,$8)",
             )
             .bind(user_id)
-            .bind(w.gp_index)
-            .bind(w.version_code)
+            .bind(gp)
+            .bind(ver)
             .bind(ms)
             .bind(f.pedal_linear)
             .bind(f.tc_off)
@@ -357,6 +342,10 @@ pub async fn hide_missing(
 
     // 5) 重算 records：被屏蔽的圈可能持有全服纪录，必须让位给下一个最快圈。
     //    口径与 admin::recalc_dims 相同，额外排除所有被屏蔽的 lap_id。
+    let mut affected_gps: Vec<i16> = dims.iter().map(|(gp, _)| *gp).collect();
+    affected_gps.sort_unstable();
+    affected_gps.dedup();
+
     for gp in &affected_gps {
         let va: Option<(i32, Uuid)> = sqlx::query_as(
             "SELECT l.lap_ms, l.user_id FROM laps l WHERE l.gp_index=$1 \
@@ -398,11 +387,12 @@ pub async fn hide_missing(
 
     tx.commit().await?;
     tracing::info!(
-        "user {user_id} hid {} missing-config lap dimensions",
-        targets.len()
+        "user {user_id} hid {} missing-config laps across {} dimensions",
+        missing.len(),
+        dims.len()
     );
     Ok(Json(HideMissingResp {
-        hidden: targets.len() as i64,
+        hidden: missing.len() as i64,
     }))
 }
 

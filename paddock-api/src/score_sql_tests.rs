@@ -646,3 +646,254 @@ async fn record_count_crosses_versions() {
     ).fetch_all(&pool).await.unwrap();
     assert_eq!(ranked, vec![(a, 1), (b, 2)], "名次按跨版本纪录数降序，同数按车手号定序");
 }
+
+// ============ 屏蔽缺失配置记录（POST /v1/me/hide-missing）============
+//
+// ⚠️ 这几条测试锁定的是 **2026-10-20 修正后的口径**：屏蔽范围 = 该用户**全部**
+//    配置缺失的圈，不是「每个维度最快的那一条」。
+//
+//    首版只屏蔽每维度获胜圈，被屏蔽那条移出 best_laps 后，回放会挑**下一条最快
+//    的圈**顶上——而它往往同样缺失，于是「缺失」与「最佳」同挂一条记录。
+//    实机数据（飞行雪绒）：65 条缺失圈只标了 7 条 = 7 个维度的获胜圈。
+//
+//    修复后必须同时满足三条不变量：
+//      A. 全部缺失圈进 hidden_missing_laps（不只获胜圈）；
+//      B. best_laps 剩下的行**绝不**指向缺失配置的圈；
+//      C. records 绝不指向被屏蔽的圈。
+
+/// 复刻 `api::account::hide_missing` 的 SQL 步骤（不含 HTTP 层）。
+///
+/// 与 handler **逐字同源**（判据复用 `laps::ASSIST_MISSING_SQL`），改动 handler
+/// 时必须同步这里，否则测试不再覆盖生产 SQL。
+async fn hide_missing_sql(pool: &PgPool, uid: Uuid) -> i64 {
+    let missing: Vec<(Uuid, i16, i32)> = sqlx::query_as(&format!(
+        "SELECT l.id, l.gp_index, l.version_code FROM laps l \
+         WHERE l.user_id = $1 AND {}",
+        crate::api::laps::ASSIST_MISSING_SQL
+    ))
+    .bind(uid)
+    .fetch_all(pool)
+    .await
+    .unwrap();
+
+    for (lap_id, _, _) in &missing {
+        sqlx::query(
+            "INSERT INTO hidden_missing_laps (user_id, lap_id) VALUES ($1, $2) \
+             ON CONFLICT (user_id, lap_id) DO NOTHING",
+        )
+        .bind(uid).bind(lap_id).execute(pool).await.unwrap();
+    }
+
+    let mut dims: Vec<(i16, i32)> = missing.iter().map(|(_, gp, ver)| (*gp, *ver)).collect();
+    dims.sort_unstable();
+    dims.dedup();
+
+    for (gp, ver) in &dims {
+        sqlx::query("DELETE FROM best_laps WHERE user_id=$1 AND gp_index=$2 AND version_code=$3")
+            .bind(uid).bind(gp).bind(ver).execute(pool).await.unwrap();
+
+        let next: Option<(i32, Option<String>, Option<String>, Option<String>, Option<String>, Option<String>)> =
+            sqlx::query_as(
+                "SELECT l.lap_ms, l.pedal_mode, l.tc_mode, l.tc_strength, l.abs_mode, l.abs_strength \
+                 FROM laps l \
+                 WHERE l.user_id=$1 AND l.gp_index=$2 AND l.version_code=$3 \
+                   AND NOT EXISTS (SELECT 1 FROM hidden_missing_laps h \
+                                   WHERE h.user_id=l.user_id AND h.lap_id=l.id) \
+                 ORDER BY l.lap_ms ASC, l.created_at ASC LIMIT 1",
+            )
+            .bind(uid).bind(gp).bind(ver).fetch_optional(pool).await.unwrap();
+        if let Some((ms, pedal, tcm, tcs, absm, abss)) = next {
+            let f = crate::api::laps::flags_of(
+                pedal.as_deref(), tcm.as_deref(), tcs.as_deref(),
+                absm.as_deref(), abss.as_deref(),
+            );
+            sqlx::query(
+                "INSERT INTO best_laps (user_id, gp_index, version_code, lap_ms, \
+                                        pedal_linear, tc_off, abs_off, abs_low) \
+                 VALUES ($1,$2,$3,$4,$5,$6,$7,$8)",
+            )
+            .bind(uid).bind(gp).bind(ver).bind(ms)
+            .bind(f.pedal_linear).bind(f.tc_off).bind(f.abs_off).bind(f.abs_low)
+            .execute(pool).await.unwrap();
+        }
+    }
+
+    let mut gps: Vec<i16> = dims.iter().map(|(gp, _)| *gp).collect();
+    gps.sort_unstable();
+    gps.dedup();
+    for gp in &gps {
+        let va: Option<(i32, Uuid)> = sqlx::query_as(
+            "SELECT l.lap_ms, l.user_id FROM laps l WHERE l.gp_index=$1 \
+               AND NOT EXISTS (SELECT 1 FROM hidden_missing_laps h WHERE h.lap_id=l.id) \
+             ORDER BY l.lap_ms ASC, l.created_at ASC LIMIT 1",
+        ).bind(gp).fetch_optional(pool).await.unwrap();
+        apply_record_sql(pool, *gp, "alltime", 0, va).await;
+
+        let versions: Vec<i32> =
+            sqlx::query_scalar("SELECT DISTINCT version_code FROM laps WHERE gp_index=$1")
+                .bind(gp).fetch_all(pool).await.unwrap();
+        for ver in versions {
+            let vb: Option<(i32, Uuid)> = sqlx::query_as(
+                "SELECT l.lap_ms, l.user_id FROM laps l \
+                 WHERE l.gp_index=$1 AND l.version_code=$2 \
+                   AND NOT EXISTS (SELECT 1 FROM hidden_missing_laps h WHERE h.lap_id=l.id) \
+                 ORDER BY l.lap_ms ASC, l.created_at ASC LIMIT 1",
+            ).bind(gp).bind(ver).fetch_optional(pool).await.unwrap();
+            apply_record_sql(pool, *gp, "version", ver, vb).await;
+        }
+    }
+    missing.len() as i64
+}
+
+/// 与 `api::account::apply_record` 同语义。
+async fn apply_record_sql(
+    pool: &PgPool, gp: i16, kind: &str, vc: i32, best: Option<(i32, Uuid)>,
+) {
+    match best {
+        None => {
+            sqlx::query("DELETE FROM records WHERE gp_index=$1 AND kind=$2 AND version_code=$3")
+                .bind(gp).bind(kind).bind(vc).execute(pool).await.unwrap();
+        }
+        Some((ms, uid)) => {
+            sqlx::query(
+                "INSERT INTO records (gp_index, kind, version_code, lap_ms, user_id, updated_at) \
+                 VALUES ($1,$2,$3,$4,$5,now()) \
+                 ON CONFLICT (gp_index, kind, version_code) \
+                 DO UPDATE SET lap_ms=EXCLUDED.lap_ms, user_id=EXCLUDED.user_id, updated_at=now()",
+            ).bind(gp).bind(kind).bind(vc).bind(ms).bind(uid)
+             .execute(pool).await.unwrap();
+        }
+    }
+}
+
+/// **核心回归**：屏蔽后 best_laps 不得再指向任何缺失配置的圈。
+///
+/// 场景精确复刻实机数据形态：某维度最快圈缺失、次快圈**也缺失**、第三快完整。
+/// 旧实现只屏蔽最快那条 → 次快圈接棒成为「最佳」，用户看到「缺失 + 最佳」同挂。
+#[tokio::test]
+#[ignore = "需要 DATABASE_URL"]
+async fn hide_missing_removes_all_missing_laps_not_just_winners() {
+    let Some(pool) = setup().await else { return };
+    wipe(&pool).await;
+    let u = mk_user(&pool, "fly", 1).await;
+
+    // GP 0：70000 缺失 / 72000 缺失 / 75000 完整 —— 三层梯度是关键
+    mk_lap(&pool, u, 0, 200150, 70000, None, None, None, None, None).await;
+    mk_lap(&pool, u, 0, 200150, 72000, None, None, None, None, None).await;
+    mk_lap(&pool, u, 0, 200150, 75000, Some("dual"), Some("custom"), Some("medium"),
+           Some("custom"), Some("weak")).await;
+    // GP 1：80000 缺失 / 81000 完整 —— 屏蔽后完整圈接棒
+    mk_lap(&pool, u, 1, 200150, 80000, None, None, None, None, None).await;
+    mk_lap(&pool, u, 1, 200150, 81000, Some("off"), Some("default"), Some("stock"),
+           Some("default"), Some("stock")).await;
+    // GP 2：90000 缺失（唯一一条）—— 屏蔽后维度整个消失
+    mk_lap(&pool, u, 2, 200150, 90000, None, None, None, None, None).await;
+
+    let n = hide_missing_sql(&pool, u).await;
+    assert_eq!(n, 4, "应屏蔽全部 4 条缺失圈（GP0×2 + GP1×1 + GP2×1）");
+
+    // 不变量 A：全部缺失圈都在表里
+    let hidden_cnt: i64 = sqlx::query_scalar(
+        "SELECT count(*)::bigint FROM hidden_missing_laps WHERE user_id=$1",
+    ).bind(u).fetch_one(&pool).await.unwrap();
+    assert_eq!(hidden_cnt, 4, "A：全部缺失圈都要标「已屏蔽」，不只获胜圈");
+
+    // 不变量 B：best_laps 剩下的行绝不指向缺失配置的圈
+    let bad: i64 = sqlx::query_scalar(
+        "SELECT count(*)::bigint FROM best_laps b \
+         JOIN laps l ON l.user_id=b.user_id AND l.gp_index=b.gp_index \
+                    AND l.version_code=b.version_code AND l.lap_ms=b.lap_ms \
+         WHERE b.user_id=$1 AND (l.pedal_mode IS NULL OR l.tc_mode IS NULL \
+               OR l.tc_strength IS NULL OR l.abs_mode IS NULL OR l.abs_strength IS NULL)",
+    ).bind(u).fetch_one(&pool).await.unwrap();
+    assert_eq!(bad, 0, "B：榜上的最佳圈绝不能是缺失配置的（旧实现的核心 bug）");
+
+    // 具体值：GP0 → 75000（完整），GP1 → 81000（完整），GP2 → 无行
+    let best: Vec<(i16, i32)> = sqlx::query_as(
+        "SELECT gp_index, lap_ms FROM best_laps WHERE user_id=$1 ORDER BY gp_index",
+    ).bind(u).fetch_all(&pool).await.unwrap();
+    assert_eq!(best, vec![(0, 75000), (1, 81000)], "GP2 无完整圈 → 维度整体退出榜单");
+
+    // 不变量 C：records 不指向被屏蔽的圈
+    let rec_bad: i64 = sqlx::query_scalar(
+        "SELECT count(*)::bigint FROM records r \
+         JOIN hidden_missing_laps h ON h.user_id=$1 \
+         JOIN laps l ON l.id=h.lap_id \
+         WHERE r.user_id=$1 AND r.gp_index=l.gp_index AND r.lap_ms=l.lap_ms",
+    ).bind(u).fetch_one(&pool).await.unwrap();
+    assert_eq!(rec_bad, 0, "C：全服纪录必须让位给未被屏蔽的圈");
+    let rec: Vec<(i16, i32)> = sqlx::query_as(
+        "SELECT gp_index, lap_ms FROM records WHERE kind='alltime' ORDER BY gp_index",
+    ).fetch_all(&pool).await.unwrap();
+    assert_eq!(rec, vec![(0, 75000), (1, 81000)], "GP2 无可用圈 → 纪录行删除");
+
+    wipe(&pool).await;
+}
+
+/// 候选预判（`count_missing_candidates`）必须与实际屏蔽行集同源。
+///
+/// 旧实现算的是「获胜圈缺失的维度数」，新实现算「全部缺失圈数」。若两者分叉，
+/// 用户会看到「有候选」→ 点了却报「没有可屏蔽的记录」，或反之。
+#[tokio::test]
+#[ignore = "需要 DATABASE_URL"]
+async fn missing_candidate_count_matches_actual_hidden_rows() {
+    let Some(pool) = setup().await else { return };
+    wipe(&pool).await;
+    let u = mk_user(&pool, "fly2", 2).await;
+
+    // 4 条缺失圈分布在 2 个维度，另 2 条完整
+    mk_lap(&pool, u, 0, 200150, 70000, None, None, None, None, None).await;
+    mk_lap(&pool, u, 0, 200150, 71000, None, None, None, None, None).await;
+    mk_lap(&pool, u, 1, 200150, 80000, None, None, None, None, None).await;
+    mk_lap(&pool, u, 1, 200150, 81000, None, None, None, None, None).await;
+    mk_lap(&pool, u, 2, 200150, 90000, Some("dual"), Some("custom"), Some("weak"),
+           Some("custom"), Some("strong")).await;
+    mk_lap(&pool, u, 3, 200150, 95000, Some("off"), Some("default"), Some("stock"),
+           Some("default"), Some("stock")).await;
+
+    // 候选数（与 handler 的 count_missing_candidates 逐字同源）
+    let predicted: i64 = sqlx::query_scalar(&format!(
+        "SELECT count(*)::bigint FROM laps l WHERE l.user_id = $1 AND {}",
+        crate::api::laps::ASSIST_MISSING_SQL
+    )).bind(u).fetch_one(&pool).await.unwrap();
+    assert_eq!(predicted, 4, "候选数 = 全部缺失圈数（不是获胜圈维度数 2）");
+
+    let actual = hide_missing_sql(&pool, u).await;
+    assert_eq!(predicted, actual, "预判数与实际屏蔽数必须相等");
+
+    wipe(&pool).await;
+}
+
+/// **快照语义**：屏蔽后新上传的缺失圈照常进榜（用户定案），不能被历史屏蔽挡住。
+///
+/// 这也是「排除条件必须用 hidden_missing_laps 的 lap_id、不能用配置判据」的
+/// 直接体现——拿「配置缺失」当过滤器会把新圈一起挡掉。
+#[tokio::test]
+#[ignore = "需要 DATABASE_URL"]
+async fn hide_missing_is_a_snapshot_new_missing_laps_still_count() {
+    let Some(pool) = setup().await else { return };
+    wipe(&pool).await;
+    let u = mk_user(&pool, "fly3", 3).await;
+
+    mk_lap(&pool, u, 0, 200150, 70000, None, None, None, None, None).await;
+    mk_lap(&pool, u, 0, 200150, 75000, Some("dual"), Some("custom"), Some("weak"),
+           Some("custom"), Some("off")).await;
+    hide_missing_sql(&pool, u).await;
+
+    // 屏蔽之后新传一条更快的缺失圈（旧版模块补传的场景）
+    mk_lap(&pool, u, 0, 200150, 68000, None, None, None, None, None).await;
+
+    // 它**不是**被屏蔽的（快照里没有它的 lap_id）→ 照常参与竞争
+    let best_ms: i32 = sqlx::query_scalar(
+        "SELECT lap_ms FROM best_laps WHERE user_id=$1 AND gp_index=0 AND version_code=200150",
+    ).bind(u).fetch_one(&pool).await.unwrap();
+    assert_eq!(best_ms, 68000, "新上传的缺失圈不在快照里，照常进榜");
+
+    let hidden: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM hidden_missing_laps h JOIN laps l ON l.id=h.lap_id \
+         WHERE h.user_id=$1 AND l.lap_ms=68000)",
+    ).bind(u).fetch_one(&pool).await.unwrap();
+    assert!(!hidden, "新圈不得被自动标记为已屏蔽");
+
+    wipe(&pool).await;
+}

@@ -373,6 +373,10 @@ pub fn flags_of(
 ///
 /// ⚠️ **TC/ABS 的 mode 与 strength 必须成对齐全**：`mode` 有值而 `strength`
 ///    为 NULL 是管理端补录写了一半的状态，同样是「配置不全」。
+/// ⚠️ **生产路径不调用它**：屏蔽/统计都走 [`ASSIST_MISSING_SQL`]（避免把全量圈
+///    拉回 Rust 侧回筛）。保留 Rust 版是为了给 SQL 表达式当**语义锚点**——
+///    `tests::sql_predicate_covers_all_five_columns` 靠它保证两者不会分叉。
+#[allow(dead_code)]
 pub fn is_assist_missing(
     pedal_mode: Option<&str>,
     tc_mode: Option<&str>,
