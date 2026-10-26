@@ -31,6 +31,9 @@ pub struct LapUpload {
     /// （只发三个字段）与不确定字段的新客户端都能通过反序列化。
     #[serde(flatten)]
     pub assist: score::AssistConfig,
+    /// 车型 + 车辆调教（2026-10-26，全部可选）。同样 flatten，旧客户端零改动。
+    #[serde(flatten)]
+    pub car_setup: score::CarSetupConfig,
 }
 
 #[derive(Serialize)]
@@ -68,12 +71,22 @@ pub async fn upload_lap(
     // 配置归一化：未知枚举值落"缺失"而非报错（前向兼容 + 数据面白名单）。
     let assist = lap.assist.normalized();
     let flags = score::AssistFlags::from(&assist);
+    // 车型 + 调教归一化：车型越界/调教半套 → 整项落 None（同上动机）。
+    let cs = lap.car_setup.normalized();
 
     // 1) 全量留档
     sqlx::query(
         "INSERT INTO laps (id, user_id, gp_index, version_code, lap_ms, \
-                           pedal_mode, tc_mode, tc_strength, abs_mode, abs_strength) \
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)",
+                           pedal_mode, tc_mode, tc_strength, abs_mode, abs_strength, \
+                           car_id, car_era, \
+                           setup_front_wing_aero, setup_rear_wing_aero, \
+                           setup_front_ride_height, setup_rear_ride_height, \
+                           setup_brake_bias, \
+                           setup_front_stiffness, setup_rear_stiffness, \
+                           setup_front_rollbar, setup_rear_rollbar, \
+                           setup_front_camber, setup_rear_camber, \
+                           setup_front_toe, setup_rear_toe) \
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25)",
     )
     .bind(Uuid::now_v7())
     .bind(user_id)
@@ -85,6 +98,21 @@ pub async fn upload_lap(
     .bind(&assist.tc_strength)
     .bind(&assist.abs_mode)
     .bind(&assist.abs_strength)
+    .bind(cs.car_id)
+    .bind(cs.car_era)
+    .bind(cs.setup_front_wing_aero)
+    .bind(cs.setup_rear_wing_aero)
+    .bind(cs.setup_front_ride_height)
+    .bind(cs.setup_rear_ride_height)
+    .bind(cs.setup_brake_bias)
+    .bind(cs.setup_front_stiffness)
+    .bind(cs.setup_rear_stiffness)
+    .bind(cs.setup_front_rollbar)
+    .bind(cs.setup_rear_rollbar)
+    .bind(cs.setup_front_camber)
+    .bind(cs.setup_rear_camber)
+    .bind(cs.setup_front_toe)
+    .bind(cs.setup_rear_toe)
     .execute(&mut *tx)
     .await?;
 

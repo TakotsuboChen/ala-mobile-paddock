@@ -14,6 +14,11 @@ mod score;
 /// 只在 test 构建下编译——生产二进制不含测试代码。
 #[cfg(test)]
 mod score_sql_tests;
+/// 车型 + 调教的端到端 SQL 测试（`#[ignore]`，需 DATABASE_URL）。
+/// 覆盖 0011 迁移的 15 个新列：INSERT/SELECT 占位符序号、`Option<f32>` ↔ `REAL`
+/// 类型匹配、半套调教归一化——这些编译期全都发现不了（sqlx 用的是运行时 query）。
+#[cfg(test)]
+mod car_setup_sql_tests;
 mod state;
 
 use anyhow::Context;

@@ -103,6 +103,35 @@ pub struct DriverLapEntry {
     pub zero_assist: bool,
     /// 上传时间（北京时间 `YYYY-MM-DD HH:MM`）
     pub created: String,
+    /// ── 车型（2026-10-26）──
+    /// 只给整数，展示名由**客户端** CarCatalog 反查渲染成
+    /// 「2026 梅赛德斯-AMG W17」。null = 缺失（旧记录 / 该圈未采到）。
+    /// ⚠️ 不要在服务端加 team_name/model_name——那与模块表双写必然漂移。
+    pub car_id: Option<i16>,
+    pub car_era: Option<i16>,
+    /// ── 车辆调教（2026-10-26）──
+    /// 存的是 UI 显示值本身（下压力 65.0 不是 0.65）。整组**全有或全无**：
+    /// 全 null = 缺失（旧记录 / 该圈没读到）。
+    /// ⚠️ `setup_brake_bias` 只有**前**值，后 = 100 − 前。
+    pub setup: Option<CarSetupView>,
+}
+
+/// `/v1/driver` 响应里的调教组。与 `laps` 表的 13 列一一对应。
+#[derive(Serialize)]
+pub struct CarSetupView {
+    pub front_wing_aero: f32,
+    pub rear_wing_aero: f32,
+    pub front_ride_height: f32,
+    pub rear_ride_height: f32,
+    pub brake_bias: f32,
+    pub front_stiffness: f32,
+    pub rear_stiffness: f32,
+    pub front_rollbar: f32,
+    pub rear_rollbar: f32,
+    pub front_camber: f32,
+    pub rear_camber: f32,
+    pub front_toe: f32,
+    pub rear_toe: f32,
 }
 
 #[derive(Serialize)]
@@ -288,6 +317,14 @@ pub async fn driver_page(
     let data_sql = format!(
         "SELECT l.id, l.gp_index, l.version_code, l.lap_ms, l.created_at, \
                 l.pedal_mode, l.tc_mode, l.tc_strength, l.abs_mode, l.abs_strength, \
+                l.car_id, l.car_era, \
+                l.setup_front_wing_aero, l.setup_rear_wing_aero, \
+                l.setup_front_ride_height, l.setup_rear_ride_height, \
+                l.setup_brake_bias, \
+                l.setup_front_stiffness, l.setup_rear_stiffness, \
+                l.setup_front_rollbar, l.setup_rear_rollbar, \
+                l.setup_front_camber, l.setup_rear_camber, \
+                l.setup_front_toe, l.setup_rear_toe, \
                 EXISTS (SELECT 1 FROM best_laps b3 WHERE b3.user_id=l.user_id \
                   AND b3.gp_index=l.gp_index AND b3.version_code=l.version_code \
                   AND b3.lap_ms=l.lap_ms) AS personal_best, \
@@ -331,6 +368,21 @@ pub async fn driver_page(
         tc_strength: Option<String>,
         abs_mode: Option<String>,
         abs_strength: Option<String>,
+        car_id: Option<i16>,
+        car_era: Option<i16>,
+        setup_front_wing_aero: Option<f32>,
+        setup_rear_wing_aero: Option<f32>,
+        setup_front_ride_height: Option<f32>,
+        setup_rear_ride_height: Option<f32>,
+        setup_brake_bias: Option<f32>,
+        setup_front_stiffness: Option<f32>,
+        setup_rear_stiffness: Option<f32>,
+        setup_front_rollbar: Option<f32>,
+        setup_rear_rollbar: Option<f32>,
+        setup_front_camber: Option<f32>,
+        setup_rear_camber: Option<f32>,
+        setup_front_toe: Option<f32>,
+        setup_rear_toe: Option<f32>,
         personal_best: bool,
         hidden: bool,
     }
@@ -379,6 +431,55 @@ pub async fn driver_page(
                     .with_timezone(&chrono::FixedOffset::east_opt(8 * 3600).unwrap())
                     .format("%Y-%m-%d %H:%M")
                     .to_string(),
+                car_id: r.car_id,
+                car_era: r.car_era,
+                // 调教整组：13 个全 Some 才输出，否则 null（半套比缺失更误导）。
+                setup: match (
+                    r.setup_front_wing_aero,
+                    r.setup_rear_wing_aero,
+                    r.setup_front_ride_height,
+                    r.setup_rear_ride_height,
+                    r.setup_brake_bias,
+                    r.setup_front_stiffness,
+                    r.setup_rear_stiffness,
+                    r.setup_front_rollbar,
+                    r.setup_rear_rollbar,
+                    r.setup_front_camber,
+                    r.setup_rear_camber,
+                    r.setup_front_toe,
+                    r.setup_rear_toe,
+                ) {
+                    (
+                        Some(front_wing_aero),
+                        Some(rear_wing_aero),
+                        Some(front_ride_height),
+                        Some(rear_ride_height),
+                        Some(brake_bias),
+                        Some(front_stiffness),
+                        Some(rear_stiffness),
+                        Some(front_rollbar),
+                        Some(rear_rollbar),
+                        Some(front_camber),
+                        Some(rear_camber),
+                        Some(front_toe),
+                        Some(rear_toe),
+                    ) => Some(CarSetupView {
+                        front_wing_aero,
+                        rear_wing_aero,
+                        front_ride_height,
+                        rear_ride_height,
+                        brake_bias,
+                        front_stiffness,
+                        rear_stiffness,
+                        front_rollbar,
+                        rear_rollbar,
+                        front_camber,
+                        rear_camber,
+                        front_toe,
+                        rear_toe,
+                    }),
+                    _ => None,
+                },
             }
         })
         .collect();

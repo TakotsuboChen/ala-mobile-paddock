@@ -48,6 +48,95 @@ pub struct AssistFlags {
     pub abs_low: bool,
 }
 
+/// 一圈的车型 + 车辆调教（2026-10-26）。全部 `Option` = 缺失。
+///
+/// **车型只存整数**（`car_id` = `CarDefinition.carId`，`car_era` = `CarType`），
+/// 展示名「2026 梅赛德斯-AMG W17」由模块侧 `CarCatalog` 反查渲染——改车队译名
+/// 只发模块，服务端永远不需要认识车型字。
+///
+/// **调教存的是 UI 显示值本身**（下压力 65.0 不是 0.65，外倾角 -3.0 度不是
+/// 弧度）。服务端不做任何换算，只在展示时格式化。
+///
+/// ⚠️ `setup_brake_bias` 只有**前**值，后值 = 100 − 前。游戏 UI 的 `60 / 40`
+/// 是派生量——不要加 rear 列，那会出现两个真值源。
+///
+/// ⚠️ 整组调教是**全有或全无**语义：模块侧用 `has_setup` 判定，解析侧
+/// [`Self::normalized`] 会拒绝半套（缺任一字段 → 整组落 None）。半套调教
+/// 比缺失更误导（看起来有数据，实际不全）。
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct CarSetupConfig {
+    pub car_id: Option<i32>,
+    pub car_era: Option<i32>,
+    pub setup_front_wing_aero: Option<f64>,
+    pub setup_rear_wing_aero: Option<f64>,
+    pub setup_front_ride_height: Option<f64>,
+    pub setup_rear_ride_height: Option<f64>,
+    pub setup_brake_bias: Option<f64>,
+    pub setup_front_stiffness: Option<f64>,
+    pub setup_rear_stiffness: Option<f64>,
+    pub setup_front_rollbar: Option<f64>,
+    pub setup_rear_rollbar: Option<f64>,
+    pub setup_front_camber: Option<f64>,
+    pub setup_rear_camber: Option<f64>,
+    pub setup_front_toe: Option<f64>,
+    pub setup_rear_toe: Option<f64>,
+}
+
+impl CarSetupConfig {
+    /// 归一化：车型越界落 None；调教半套 → 整组落 None。
+    ///
+    /// 与 [`AssistConfig::normalized`] 同一动机——宁可记缺失也不丢圈，
+    /// 同时堵住客户端塞入无意义数据污染数据面。
+    pub fn normalized(self) -> Self {
+        // 车型区间与模块侧 CarCatalog 一致：2023 地效 0..19、2026 主动空力 20..41。
+        // era 只接受 0/1（CarType 枚举）。任一不合法 → 两个都落 None
+        // （半个车型没有意义，服务端无法反查展示名）。
+        let (car_id, car_era) = match (self.car_id, self.car_era) {
+            (Some(id), Some(era)) if (0..=41).contains(&id) && (0..=1).contains(&era) => {
+                (Some(id), Some(era))
+            }
+            _ => (None, None),
+        };
+
+        // 调教整组：13 个全 Some 才保留，否则整组 None。
+        let setup = [
+            self.setup_front_wing_aero,
+            self.setup_rear_wing_aero,
+            self.setup_front_ride_height,
+            self.setup_rear_ride_height,
+            self.setup_brake_bias,
+            self.setup_front_stiffness,
+            self.setup_rear_stiffness,
+            self.setup_front_rollbar,
+            self.setup_rear_rollbar,
+            self.setup_front_camber,
+            self.setup_rear_camber,
+            self.setup_front_toe,
+            self.setup_rear_toe,
+        ];
+        let complete = setup.iter().all(|v| v.is_some());
+        let keep = |v: Option<f64>| if complete { v } else { None };
+
+        CarSetupConfig {
+            car_id,
+            car_era,
+            setup_front_wing_aero: keep(self.setup_front_wing_aero),
+            setup_rear_wing_aero: keep(self.setup_rear_wing_aero),
+            setup_front_ride_height: keep(self.setup_front_ride_height),
+            setup_rear_ride_height: keep(self.setup_rear_ride_height),
+            setup_brake_bias: keep(self.setup_brake_bias),
+            setup_front_stiffness: keep(self.setup_front_stiffness),
+            setup_rear_stiffness: keep(self.setup_rear_stiffness),
+            setup_front_rollbar: keep(self.setup_front_rollbar),
+            setup_rear_rollbar: keep(self.setup_rear_rollbar),
+            setup_front_camber: keep(self.setup_front_camber),
+            setup_rear_camber: keep(self.setup_rear_camber),
+            setup_front_toe: keep(self.setup_front_toe),
+            setup_rear_toe: keep(self.setup_rear_toe),
+        }
+    }
+}
+
 /// 枚举白名单：写入 `laps` 前归一化，未知值一律落 None（= 缺失）。
 ///
 /// 为什么不在反序列化层拒绝：旧模块可能带未来版本的枚举值（前向兼容），
