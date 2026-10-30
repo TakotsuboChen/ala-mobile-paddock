@@ -453,6 +453,10 @@ pub fn is_assist_missing(
     abs_mode: Option<&str>,
     abs_strength: Option<&str>,
 ) -> bool {
+    // ⚠️ `"invalid"` **不算缺失**（2026-10-30 用户定案）：它表示"配置拿到了，
+    //    但本圈中途变过"，是一条有内容的判定，不是"没读到"。若把它算成缺失，
+    //    用户圈中改一次配置就会整圈被「屏蔽缺失配置记录」移出榜单——正是本次
+    //    要修的问题。无效维只是不加分（见 score.rs 的 AssistFlags），圈照常上榜。
     pedal_mode.is_none()
         || tc_mode.is_none()
         || tc_strength.is_none()
@@ -464,6 +468,8 @@ pub fn is_assist_missing(
 ///
 /// 与 [`is_assist_missing`] **逐字对应**：任一列 IS NULL 即为缺失。
 /// 两处若分叉，"能不能屏蔽"的预判与实际屏蔽的行集就会不一致。
+///
+/// ⚠️ 只判 `IS NULL`，**不判 `'invalid'`**——理由见 [`is_assist_missing`]。
 pub const ASSIST_MISSING_SQL: &str = "(l.pedal_mode IS NULL OR l.tc_mode IS NULL \
      OR l.tc_strength IS NULL OR l.abs_mode IS NULL OR l.abs_strength IS NULL)";
 
@@ -500,15 +506,23 @@ pub const AUTO_HIDDEN_SQL: &str = "(u.hidden_missing_at IS NOT NULL AND \
       OR l.abs_mode IS NULL OR l.abs_strength IS NULL))";
 
 /// 踏板档位 token → 展示名（管理端下拉与"配置"列共用同一张表）。
-pub const PEDAL_TOKENS: [(&str, &str); 3] =    [("off", "原生按键"), ("single", "单踏板"), ("dual", "双踏板")];
+pub const PEDAL_TOKENS: [(&str, &str); 4] = [
+    ("off", "原生按键"),
+    ("single", "单踏板"),
+    ("dual", "双踏板"),
+    // 「无效」= 本圈中途变过配置，不可采信（2026-10-30）。
+    (crate::score::INVALID_TOKEN, "无效"),
+];
 
 /// TC/ABS 档位 token → 展示名。`stock` = 最高档，也代表"未开自定义（游戏默认）"。
-pub const STRENGTH_TOKENS: [(&str, &str); 5] = [
+pub const STRENGTH_TOKENS: [(&str, &str); 6] = [
     ("off", "关"),
     ("weak", "低"),
     ("medium", "中"),
     ("strong", "高"),
     ("stock", "最高"),
+    // 同 PEDAL_TOKENS：配置在圈中变过 ⇒ 该维不可采信。
+    (crate::score::INVALID_TOKEN, "无效"),
 ];
 
 /// token → 展示名。**唯一查表入口**：`&str` 是 `'static`，返回的 `&'static str`
@@ -532,7 +546,16 @@ pub fn token_label(tokens: &'static [(&'static str, &'static str)], token: &str)
 /// 只会让"配置"列多出一列没人看的"默认/自定义"，纯占地方。
 ///
 /// 数据面仍存原始两维（`laps.tc_mode` / `tc_strength`）——合并只发生在展示层。
+///
+/// ⚠️ `"invalid"` 优先于其他判断（2026-10-30）：mode 与 strength 两列会被模块
+///    **成对**标成 invalid，但管理端补录可能只写了一半，任一为 invalid 即整维
+///    显示「无效」——不能因为另一列有值就把它当正常档位展示。
 fn collapse_mode(mode: Option<&str>, strength: Option<&str>) -> String {
+    if mode == Some(crate::score::INVALID_TOKEN)
+        || strength == Some(crate::score::INVALID_TOKEN)
+    {
+        return crate::score::INVALID_TOKEN.to_string();
+    }
     match mode {
         None => String::new(),                        // 缺失
         Some("default") => "stock".to_string(),       // 默认 ≡ 最高
@@ -594,6 +617,13 @@ pub fn tokens_to_raw(
     let expand = |t: &str| -> (Option<String>, Option<String>) {
         if t.is_empty() {
             (None, None)
+        } else if t == crate::score::INVALID_TOKEN {
+            // 「无效」维必须**两列都写** invalid：`is_assist_missing` 逐列判 NULL，
+            // 只写一半会变成"管理端补录写了一半"的残缺状态。
+            (
+                Some(crate::score::INVALID_TOKEN.to_string()),
+                Some(crate::score::INVALID_TOKEN.to_string()),
+            )
         } else if t == "stock" {
             (Some("default".to_string()), Some("stock".to_string()))
         } else {
@@ -634,7 +664,7 @@ pub fn router() -> Router<AppState> {
 
 #[cfg(test)]
 mod tests {
-    use super::is_assist_missing;
+    use super::{assist_display, is_assist_missing, tokens_to_raw};
 
     /// 五维齐全 = 完整。注意 `pedal_mode=off` / `tc_mode=default` 是**有效值**，
     /// 不是缺失——这正是"不能只看 best_laps 派生位"的原因。
@@ -693,5 +723,89 @@ mod tests {
             );
         }
         assert_eq!(super::ASSIST_MISSING_SQL.matches("IS NULL").count(), 5);
+    }
+
+    /// `"invalid"`（本圈中途改过配置）**不算缺失**——圈照常上榜。
+    ///
+    /// 用户定案 2026-10-30：把 invalid 算成缺失会让「圈中改一次 ABS」导致整圈
+    /// 被「屏蔽缺失配置记录」移出榜单，正是本次要修的问题。invalid 维只是
+    /// 不加分（见 score.rs 的 AssistFlags）。
+    #[test]
+    fn invalid_token_is_not_missing() {
+        // 只有 ABS 两列 invalid，其余正常 ⇒ 不缺失。
+        assert!(!is_assist_missing(
+            Some("dual"),
+            Some("custom"),
+            Some("off"),
+            Some("invalid"),
+            Some("invalid"),
+        ));
+        // 五维全 invalid 也不缺失（配置全拿到了，只是全都在圈中变过）。
+        assert!(!is_assist_missing(
+            Some("invalid"),
+            Some("invalid"),
+            Some("invalid"),
+            Some("invalid"),
+            Some("invalid"),
+        ));
+        // SQL 侧必须同样不含 invalid 判据，否则两侧口径分叉。
+        assert!(
+            !super::ASSIST_MISSING_SQL.contains("invalid"),
+            "SQL 判据不该把 'invalid' 算作缺失"
+        );
+    }
+
+    /// `"invalid"` 展示成「无效」，且优先于 mode/strength 的其他取值。
+    #[test]
+    fn invalid_token_displays_as_wu_xiao() {
+        // custom + invalid strength（管理端只写了一半）→ 整维「无效」。
+        let (_, tc, _) = assist_display(Some("dual"), Some("custom"), Some("invalid"), None, None);
+        assert_eq!(tc, "无效");
+        // mode 与 strength 都 invalid → 同样「无效」。
+        let (_, tc2, abs2) = assist_display(
+            Some("dual"),
+            Some("invalid"),
+            Some("invalid"),
+            Some("invalid"),
+            Some("invalid"),
+        );
+        assert_eq!(tc2, "无效");
+        assert_eq!(abs2, "无效");
+        // 正常档位不受影响。
+        let (p, tc3, abs3) = assist_display(Some("dual"), Some("custom"), Some("off"), None, None);
+        assert_eq!(p, "双踏板");
+        assert_eq!(tc3, "关");
+        assert_eq!(abs3, "缺失");
+    }
+
+    /// `"invalid"` 维**不加分**（等于竞赛条件被改变过，不能据此享受加成）。
+    #[test]
+    fn invalid_token_grants_no_bonus() {
+        use crate::score::{AssistConfig, AssistFlags};
+        let cfg = AssistConfig {
+            pedal_mode: Some("invalid".into()),
+            tc_mode: Some("custom".into()),
+            tc_strength: Some("invalid".into()),
+            abs_mode: Some("custom".into()),
+            abs_strength: Some("invalid".into()),
+        };
+        let flags = AssistFlags::from(&cfg);
+        assert!(!flags.pedal_linear, "invalid 踏板不该算线性踏板");
+        assert!(!flags.tc_off, "invalid TC 档位不该算关 TC");
+        assert!(!flags.abs_off, "invalid ABS 档位不该算关 ABS");
+        assert!(!flags.abs_low, "invalid ABS 档位不该算低档");
+        assert_eq!(flags.bonus_pct(), 0.0);
+    }
+
+    /// 管理端补录「无效」时两列成对写 invalid（不能只写一半）。
+    #[test]
+    fn tokens_to_raw_writes_invalid_to_both_columns() {
+        let (p, tcm, tcs, absm, abss) =
+            tokens_to_raw("invalid", "invalid", "invalid");
+        assert_eq!(p.as_deref(), Some("invalid"));
+        assert_eq!(tcm.as_deref(), Some("invalid"));
+        assert_eq!(tcs.as_deref(), Some("invalid"));
+        assert_eq!(absm.as_deref(), Some("invalid"));
+        assert_eq!(abss.as_deref(), Some("invalid"));
     }
 }

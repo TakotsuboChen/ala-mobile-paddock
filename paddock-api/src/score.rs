@@ -27,6 +27,15 @@
 
 use serde::Deserialize;
 
+/// 该维「无效」的哨兵 token（2026-10-30）。
+///
+/// 语义 = 配置拿到了，但**这一圈中途变过**，无法确定整圈用的是哪档 ⇒
+/// 不可作为成绩属性采信（不加分、不参与金标）。
+///
+/// ⚠️ 与 `None`（缺失 = 根本没拿到）**必须区分**：折成缺失会让用户看不出是
+///    自己中途改了配置。模块侧同值见 `ModConfig.LapAssistCodes.INVALID_TOKEN`。
+pub const INVALID_TOKEN: &str = "invalid";
+
 /// 辅助配置四维（缺失 = None）。管理端补录与模块上报共用同一套枚举字符串。
 ///
 /// `Default` 全 None = 缺失——旧模块不传字段时 serde 自然落到这里。
@@ -147,11 +156,20 @@ impl AssistConfig {
         fn keep(v: Option<String>, allowed: &[&str]) -> Option<String> {
             v.filter(|s| allowed.contains(&s.as_str()))
         }
-        self.pedal_mode = keep(self.pedal_mode, &["off", "single", "dual"]);
-        self.tc_mode = keep(self.tc_mode, &["default", "custom"]);
-        self.tc_strength = keep(self.tc_strength, &["off", "weak", "medium", "strong", "stock"]);
-        self.abs_mode = keep(self.abs_mode, &["default", "custom"]);
-        self.abs_strength = keep(self.abs_strength, &["off", "weak", "medium", "strong", "stock"]);
+        // `"invalid"` = 该维在本圈中途变过配置（模块判定，2026-10-30）。
+        // ⚠️ 必须进白名单，否则会被归一化成 None（= 缺失）——那就退回到
+        //    "用户看不出是自己改的配置"的老问题。
+        self.pedal_mode = keep(self.pedal_mode, &["off", "single", "dual", INVALID_TOKEN]);
+        self.tc_mode = keep(self.tc_mode, &["default", "custom", INVALID_TOKEN]);
+        self.tc_strength = keep(
+            self.tc_strength,
+            &["off", "weak", "medium", "strong", "stock", INVALID_TOKEN],
+        );
+        self.abs_mode = keep(self.abs_mode, &["default", "custom", INVALID_TOKEN]);
+        self.abs_strength = keep(
+            self.abs_strength,
+            &["off", "weak", "medium", "strong", "stock", INVALID_TOKEN],
+        );
         self
     }
 }
@@ -160,6 +178,10 @@ impl From<&AssistConfig> for AssistFlags {
     /// ⚠️ 关 TC / 关 ABS **必须**同时满足 `mode == "custom"`——
     /// `mode == "default"` 表示原生透传，此时 `strength` 字段只是 UI 记忆值、
     /// 不生效，读它会把"从未调过 TC"的用户误判成"关 TC"（加 10% 分）。
+    ///
+    /// ⚠️ `"invalid"` 维一律**不加分**（2026-10-30）：该维在本圈中途变过配置，
+    /// 等于竞赛条件被改变过，不能据此享受加成。它也不是"关"——所以下面每个
+    /// 判据都要求值**精确等于**目标 token，`"invalid"` 天然落空。
     fn from(c: &AssistConfig) -> Self {
         let custom = |m: &Option<String>| m.as_deref() == Some("custom");
         let is = |s: &Option<String>, v: &str| s.as_deref() == Some(v);
@@ -449,6 +471,38 @@ mod tests {
         assert!(flags_of(cfg("off", "custom", "off", "custom", "off")).is_zero_assist());
         assert!(flags_of(cfg("dual", "custom", "off", "custom", "off")).is_zero_assist());
         assert!(!flags_of(cfg("dual", "custom", "off", "custom", "stock")).is_zero_assist());
+    }
+
+    /// `"invalid"` 维：不加分、不给金标，但也**不是**"关"。
+    ///
+    /// 用户定案 2026-10-30：invalid = 本圈中途改过配置 ⇒ 竞赛条件被改变过，
+    /// 不能据此享受加成；但它也不代表用户"关掉了辅助"，所以不能算零辅助。
+    #[test]
+    fn invalid_dimension_grants_nothing() {
+        // 只有 ABS 维 invalid，其余正常：ABS 的两个加分项都不触发。
+        let f = flags_of(cfg("dual", "custom", "off", "invalid", "invalid"));
+        assert!(f.pedal_linear, "踏板维正常，照常给线性踏板加成");
+        assert!(f.tc_off, "TC 维正常，照常算关 TC");
+        assert!(!f.abs_off, "ABS 维 invalid 不算关");
+        assert!(!f.abs_low, "ABS 维 invalid 也不算低档");
+        assert_eq!(f.bonus_pct(), 0.20); // 踏板 0.10 + TC 0.10
+        assert!(!f.is_zero_assist(), "ABS 维 invalid ⇒ 不是零辅助，不给金标");
+
+        // 五维全 invalid：什么分都没有。
+        let all = flags_of(cfg("invalid", "invalid", "invalid", "invalid", "invalid"));
+        assert_eq!(all.bonus_pct(), 0.0);
+        assert!(!all.is_zero_assist());
+    }
+
+    /// `"invalid"` 必须能通过 `normalized()` 白名单（否则会被归一成缺失）。
+    #[test]
+    fn invalid_token_survives_normalization() {
+        let n = cfg("invalid", "invalid", "invalid", "invalid", "invalid").normalized();
+        assert_eq!(n.pedal_mode.as_deref(), Some("invalid"));
+        assert_eq!(n.tc_mode.as_deref(), Some("invalid"));
+        assert_eq!(n.tc_strength.as_deref(), Some("invalid"));
+        assert_eq!(n.abs_mode.as_deref(), Some("invalid"));
+        assert_eq!(n.abs_strength.as_deref(), Some("invalid"));
     }
 
     /// 总分 = 基础分 + 加成，且加成基于**基础分**而非总分。

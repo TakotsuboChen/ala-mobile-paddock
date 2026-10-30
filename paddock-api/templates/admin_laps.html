@@ -82,8 +82,8 @@ function readLap(mask){
  *
  * 表中的 value 必须与服务端 `laps::PEDAL_TOKENS` / `STRENGTH_TOKENS` 逐字对齐。
  */
-const PEDAL_TOKENS = [['','缺失'],['off','原生按键'],['single','单踏板'],['dual','双踏板']];
-const STRENGTH_TOKENS = [['','缺失'],['off','关'],['weak','低'],['medium','中'],['strong','高'],['stock','最高']];
+const PEDAL_TOKENS = [['','缺失'],['off','原生按键'],['single','单踏板'],['dual','双踏板'],['invalid','无效']];
+const STRENGTH_TOKENS = [['','缺失'],['off','关'],['weak','低'],['medium','中'],['strong','高'],['stock','最高'],['invalid','无效']];
 function assistInputs(v){
   v = v || {};
   const opts = (list, cur) => list.map(([k,d]) =>
@@ -95,7 +95,7 @@ function assistInputs(v){
     <select id="m-tc" style="width:100%;padding:.4rem;border-radius:6px;border:1px solid #444;background:#2a2a2c;color:#eee">${opts(STRENGTH_TOKENS, v.tc||'')}</select>
     <label>ABS</label>
     <select id="m-abs" style="width:100%;padding:.4rem;border-radius:6px;border:1px solid #444;background:#2a2a2c;color:#eee">${opts(STRENGTH_TOKENS, v.abs||'')}</select>
-    <p class="hint">"最高" = 未调低辅助（含游戏默认）。缺失 = 旧记录/未上报，不计加分。</p>
+    <p class="hint">"最高" = 未调低辅助（含游戏默认）。缺失 = 旧记录/未上报，不计加分。无效 = 该维在跑圈中途改过配置，不计加分但<b>不会</b>导致整圈被屏蔽。</p>
   </div>`;
 }
 function readAssist(){
