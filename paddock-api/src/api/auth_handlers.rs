@@ -95,12 +95,31 @@ pub async fn register_request(
 /// 反复注册-放弃的用户不会被越推越后，弃号立即回收。并发注册可能同时选中同一号
 /// ——reg_seq 唯一约束会让后者建号失败重试，竞态窗口极小，可接受。
 /// 注意 PG 查询非事务性锁——高并发下靠唯一约束兜底，不额外加锁。
-/// 公开给 qq_bot 调用；建号失败（openid 已绑号等）由调用方回滚并回复错误文案。
+/// 公开给 bot 层调用；建号失败（身份已绑号等）由调用方回滚并回复错误文案。
+///
+/// `platform` 决定身份写入哪一列：
+///   QQ       → `users.member_openid`（TEXT）
+///   Telegram → `users.telegram_id`（BIGINT）
+/// 两列互不重叠——两平台账号体系独立（用户 2026-11-03 定案）。
 pub async fn create_user_from_pending(
     pool: &PgPool,
     reg_code: &str,
-    member_openid: &str,
+    platform: crate::bot_core::Platform,
+    identity_id: &str,
 ) -> Result<Uuid, (StatusCode, String)> {
+    use crate::bot_core::Platform;
+
+    // Telegram 的 id 是 BIGINT；解析失败说明上游给的不是合法数字，直接按「码无效」处理
+    let telegram_id: Option<i64> = match platform {
+        Platform::Qq => None,
+        Platform::Telegram => match identity_id.parse::<i64>() {
+            Ok(v) => Some(v),
+            Err(_) => {
+                return Err((StatusCode::BAD_REQUEST, "Telegram 身份格式异常".into()));
+            }
+        },
+    };
+
     let mut tx = pool.begin().await.map_err(internal)?;
     let row: Option<(String, String)> = sqlx::query_as(
         "DELETE FROM pending_regs WHERE reg_code = $1 AND expires_at > now() \
@@ -113,16 +132,30 @@ pub async fn create_user_from_pending(
     let Some((username, pass_hash)) = row else {
         return Err((StatusCode::NOT_FOUND, "校验码无效或已过期，请重新申请".into()));
     };
-    if sqlx::query_scalar::<_, i64>("SELECT count(*) FROM users WHERE member_openid = $1")
-        .bind(member_openid)
-        .fetch_one(&mut *tx)
-        .await
-        .map_err(internal)?
-        > 0
-    {
+    // 该平台身份是否已绑过账号（两平台各查各的列）
+    let already: i64 = match platform {
+        Platform::Qq => {
+            sqlx::query_scalar("SELECT count(*) FROM users WHERE member_openid = $1")
+                .bind(identity_id)
+                .fetch_one(&mut *tx)
+                .await
+        }
+        Platform::Telegram => {
+            sqlx::query_scalar("SELECT count(*) FROM users WHERE telegram_id = $1")
+                .bind(telegram_id)
+                .fetch_one(&mut *tx)
+                .await
+        }
+    }
+    .map_err(internal)?;
+    if already > 0 {
+        let who = match platform {
+            Platform::Qq => "QQ",
+            Platform::Telegram => "Telegram",
+        };
         return Err((
             StatusCode::CONFLICT,
-            "该 QQ 身份已绑定过账号，不允许重复注册".into(),
+            format!("该 {who} 身份已绑定过账号，不允许重复注册"),
         ));
     }
     // 最小空缺号：1..=max+1 中第一个未被占用的值（无用户时 = 1）
@@ -136,12 +169,14 @@ pub async fn create_user_from_pending(
     .map_err(internal)?;
     let user_id = Uuid::now_v7();
     sqlx::query(
-        "INSERT INTO users (id, username, pass_hash, member_openid, reg_seq) VALUES ($1,$2,$3,$4,$5)",
+        "INSERT INTO users (id, username, pass_hash, member_openid, telegram_id, reg_seq) \
+         VALUES ($1,$2,$3,$4,$5,$6)",
     )
     .bind(user_id)
     .bind(&username)
     .bind(&pass_hash)
-    .bind(member_openid)
+    .bind(if platform == Platform::Qq { Some(identity_id) } else { None })
+    .bind(telegram_id)
     .bind(reg_seq)
     .execute(&mut *tx)
     .await

@@ -1,0 +1,14 @@
+-- Telegram @username（可空、可变更）。
+--
+-- 用途：播报时生成 `@username` 形式的提及实体（Telegram 的 `mention` 类型），
+-- 与客户端「右键提及」一致。**不参与身份识别**——识别仍用 `telegram_id`。
+--
+-- 为什么不放在 0012：0012 已在生产库执行过，修改已应用的迁移文件不会重跑。
+--
+-- 数据来源（两条路，都不需要用户重新注册）：
+--   1. 被动：用户每次在群里发言，`message.from.username` 顺手更新
+--   2. 主动：`getChatMember(chat_id, user_id)` 补查存量用户
+--
+-- ⚠️ username 可为 NULL（很多用户没设置），也可随时变更 ⇒ 使用方必须能退化到
+-- `text_mention`（蓝字形式，只需 user id）。
+ALTER TABLE users ADD COLUMN telegram_username TEXT;

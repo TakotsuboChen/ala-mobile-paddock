@@ -85,6 +85,8 @@ struct UserRow {
     id: String,
     username: String,
     member_openid: String,
+    /// Telegram user id（未绑定为空）——与 member_openid 互不重叠，两平台账号独立
+    telegram_id: String,
     reg_seq: i64,
     created: String,
     best_count: i64,
@@ -207,7 +209,7 @@ async fn fetch_users(pool: &PgPool, q: &str, size: i64, offset: i64) -> (Vec<Use
         .await
         .unwrap_or(0);
     let rows: Vec<UserRow> = sqlx::query_as(
-        "SELECT u.id, u.username, u.member_openid, u.reg_seq, u.created_at, \
+        "SELECT u.id, u.username, u.member_openid, u.telegram_id, u.reg_seq, u.created_at, \
          (SELECT count(*) FROM best_laps b WHERE b.user_id = u.id) \
          FROM users u WHERE u.username LIKE $1 ORDER BY u.reg_seq ASC LIMIT $2 OFFSET $3",
     )
@@ -219,10 +221,11 @@ async fn fetch_users(pool: &PgPool, q: &str, size: i64, offset: i64) -> (Vec<Use
     .unwrap_or_default()
     .into_iter()
     .map(
-        |(id, username, openid, seq, created, cnt): (
+        |(id, username, openid, tg_id, seq, created, cnt): (
             Uuid,
             String,
             Option<String>,
+            Option<i64>,
             i64,
             chrono::DateTime<Utc>,
             i64,
@@ -230,6 +233,7 @@ async fn fetch_users(pool: &PgPool, q: &str, size: i64, offset: i64) -> (Vec<Use
             id: id.to_string(),
             username,
             member_openid: openid.unwrap_or_default(),
+            telegram_id: tg_id.map(|v| v.to_string()).unwrap_or_default(),
             reg_seq: seq,
             created: bj_time(created).format("%Y-%m-%d").to_string(),
             best_count: cnt,
@@ -1489,6 +1493,14 @@ struct SettingsTemplate {
     site_logo_src: String,
     bot_app_id: String,
     bot_secret_set: bool,
+    /// Telegram bot token（脱敏：只回显「已设置」，不回显值）
+    tg_token_set: bool,
+    /// Telegram webhook secret 是否已设置
+    tg_secret_set: bool,
+    /// Telegram 已知 chat 列表（JSON 数组，前端 tgRenderChats 用）
+    tg_known_chats_json: String,
+    /// Telegram 已勾选的播报 chat，JSON 数组
+    tg_broadcast_chats_json: String,
     rules_json: String,
     /// 内置动作元数据 JSON（前端渲染动作下拉/失败字段/默认文案的唯一事实源，
     /// 替代此前 JS 里的 ACTIONS/FAIL_FIELDS/PRESET_FAIL 三份硬编码镜像）。
@@ -1523,6 +1535,16 @@ async fn render_settings(state: &App) -> Response {
                 .ok();
         }
     }
+    let tg_token_set = crate::qq_bot::get_cfg(&state.pool, "tg_bot_token")
+        .await
+        .map(|s| !s.is_empty())
+        .unwrap_or(false);
+    let tg_secret_set = crate::qq_bot::get_cfg(&state.pool, "tg_webhook_secret")
+        .await
+        .map(|s| !s.is_empty())
+        .unwrap_or(false);
+    let tg_bc_list = crate::telegram_bot::broadcast_chats(&state.pool).await;
+    let tg_known_list = crate::telegram_bot::known_chats(&state.pool).await;
     let rules_json = crate::qq_bot::load_rules_json(&state.pool).await;
     let (dash_title, dash_logo) = brand(&state.pool).await;
     let body = SettingsTemplate {
@@ -1531,6 +1553,10 @@ async fn render_settings(state: &App) -> Response {
         site_title: dash_title.clone(),
         bot_app_id: app_id,
         bot_secret_set: secret_set,
+        tg_token_set,
+        tg_secret_set,
+        tg_known_chats_json: serde_json::to_string(&tg_known_list).unwrap_or_else(|_| "[]".into()),
+        tg_broadcast_chats_json: serde_json::to_string(&tg_bc_list).unwrap_or_else(|_| "[]".into()),
         rules_json,
         actions_json: serde_json::to_string(&crate::qq_bot::action_metas())
             .unwrap_or_else(|_| "[]".into()),
@@ -1653,6 +1679,218 @@ async fn api_change_username(
         .ok();
     audit(&state.pool, "change_admin_username", json!({"new": name})).await;
     api_res(true, "用户名已修改，请重新登录")
+}
+
+// ---------- Telegram bot 配置 ----------
+
+#[derive(Deserialize)]
+struct ApiTgConfig {
+    #[serde(default)]
+    tg_bot_token: String,
+    #[serde(default)]
+    tg_webhook_secret: String,
+}
+
+/// 保存 Telegram token / secret，并**立即调用 setWebhook 注册**。
+///
+/// 为什么不启动时自注册：启动路径不该耦合外网调用（token 未配置时还要分支），
+/// 且用户改域名后不会自动重注册。保存时注册 = 立即看到结果，改域名靠「重新保存」修复。
+async fn api_save_telegram_config(
+    State(state): State<App>,
+    headers: HeaderMap,
+    Json(f): Json<ApiTgConfig>,
+) -> Response {
+    if require_admin(&state, &headers).await.is_none() {
+        return api_res(false, "会话已过期，请重新登录");
+    }
+    let token = f.tg_bot_token.trim().to_string();
+    let mut secret = f.tg_webhook_secret.trim().to_string();
+
+    // token 留空 = 保留原值（不回显，防泄露）；secret 留空 = 保留或自动生成
+    let token = if token.is_empty() {
+        match crate::qq_bot::get_cfg(&state.pool, "tg_bot_token").await {
+            Some(t) if !t.is_empty() => t,
+            _ => return api_res(false, "Bot Token 必填"),
+        }
+    } else {
+        crate::qq_bot::set_cfg(&state.pool, "tg_bot_token", &token).await.ok();
+        token
+    };
+    if secret.is_empty() {
+        secret = match crate::qq_bot::get_cfg(&state.pool, "tg_webhook_secret").await {
+            Some(s) if !s.is_empty() => s,
+            // 首次保存：自动生成 32 字符 secret（Telegram 只允许 A-Z a-z 0-9 _ -）
+            _ => {
+                let s = uuid::Uuid::new_v4().simple().to_string();
+                crate::qq_bot::set_cfg(&state.pool, "tg_webhook_secret", &s).await.ok();
+                s
+            }
+        };
+    } else {
+        // 只允许 Telegram 接受的字符集
+        if !secret.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-') {
+            return api_res(false, "Webhook Secret 只能包含字母、数字、下划线和连字符");
+        }
+        if secret.len() > 256 {
+            return api_res(false, "Webhook Secret 最长 256 字符");
+        }
+        crate::qq_bot::set_cfg(&state.pool, "tg_webhook_secret", &secret).await.ok();
+    }
+
+    // 取 bot 自身信息：顺带缓存 username（@ 提及判定要用），并自检隐私模式
+    let mut hint = String::new();
+    if let Ok(me) = crate::telegram_bot::get_me(&token).await {
+        if let Some(name) = me.pointer("/result/username").and_then(|v| v.as_str()) {
+            crate::qq_bot::set_cfg(&state.pool, "tg_bot_username", name).await.ok();
+        }
+        let can_read = me
+            .pointer("/result/can_read_all_group_messages")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        if !can_read {
+            hint.push_str("\n⚠️ 隐私模式仍开启：BotFather /setprivacy 关闭后需把机器人移出群再重加，或设为群管理员。");
+        }
+    }
+
+    // 注册 webhook
+    let site = crate::qq_bot::get_cfg(&state.pool, "site_url")
+        .await
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| "https://paddock.takotsubo.cloud".to_string());
+    let url = format!("{}/tg/webhook", site.trim_end_matches('/'));
+    match crate::telegram_bot::set_webhook(&token, &url, &secret).await {
+        Ok(v) => {
+            let ok = v.get("ok").and_then(|b| b.as_bool()).unwrap_or(false);
+            audit(&state.pool, "save_telegram_config", json!({"webhook": url, "ok": ok})).await;
+            if ok {
+                api_res(true, &format!("已保存并注册 webhook：{url}{hint}"))
+            } else {
+                api_res(false, &format!("已保存，但注册 webhook 失败：{}", v))
+            }
+        }
+        Err(e) => {
+            audit(&state.pool, "save_telegram_config", json!({"webhook": url, "error": e.to_string()})).await;
+            api_res(false, &format!("已保存，但注册 webhook 出错：{e}"))
+        }
+    }
+}
+
+/// `getWebhookInfo` + `getMe` 状态检查（排障用）。
+/// `last_error_message` 直接暴露 401/403 原因（secret 不匹配 / bot 被踢出群）。
+async fn api_telegram_status(State(state): State<App>, headers: HeaderMap) -> Response {
+    if require_admin(&state, &headers).await.is_none() {
+        return api_res(false, "会话已过期，请重新登录");
+    }
+    let Some(token) = crate::qq_bot::get_cfg(&state.pool, "tg_bot_token")
+        .await
+        .filter(|s| !s.is_empty())
+    else {
+        return api_res(false, "Bot Token 未配置");
+    };
+    let mut lines = Vec::new();
+    match crate::telegram_bot::get_me(&token).await {
+        Ok(v) => {
+            let name = v.pointer("/result/username").and_then(|x| x.as_str()).unwrap_or("?");
+            let can_read = v
+                .pointer("/result/can_read_all_group_messages")
+                .and_then(|x| x.as_bool())
+                .unwrap_or(false);
+            lines.push(format!("机器人：@{name}"));
+            lines.push(format!(
+                "群内全量消息：{}",
+                if can_read { "✅ 可读取" } else { "❌ 隐私模式开启（收不到非 @ 消息）" }
+            ));
+        }
+        Err(e) => lines.push(format!("getMe 失败：{e}")),
+    }
+    // 顺带补查存量用户的 @username（播报 @ 形式需要它；失败不阻塞）
+    let (ok, fail) = crate::telegram_bot::backfill_usernames(&state.pool).await;
+    if ok + fail > 0 {
+        lines.push(format!("@username 补查：{ok} 成功 / {fail} 未取到"));
+    }
+    match crate::telegram_bot::get_webhook_info(&token).await {
+        Ok(v) => {
+            let r = v.get("result").cloned().unwrap_or(serde_json::Value::Null);
+            let url = r.get("url").and_then(|x| x.as_str()).unwrap_or("");
+            let pending = r.get("pending_update_count").and_then(|x| x.as_i64()).unwrap_or(0);
+            let last_err = r.get("last_error_message").and_then(|x| x.as_str()).unwrap_or("");
+            lines.push(format!("Webhook：{}", if url.is_empty() { "❌ 未注册".to_string() } else { url.to_string() }));
+            lines.push(format!("积压更新：{pending}"));
+            if !last_err.is_empty() {
+                lines.push(format!("最近错误：{last_err}"));
+            }
+        }
+        Err(e) => lines.push(format!("getWebhookInfo 失败：{e}")),
+    }
+    api_res(true, &lines.join("\n"))
+}
+
+#[derive(Deserialize)]
+struct ApiTgChatAdd {
+    chat_id: String,
+}
+
+/// 手动添加 chat_id（Telegram 没有「列出我加入的群」的接口，只能手动填）。
+async fn api_telegram_chat_add(
+    State(state): State<App>,
+    headers: HeaderMap,
+    Json(f): Json<ApiTgChatAdd>,
+) -> Response {
+    if require_admin(&state, &headers).await.is_none() {
+        return api_res(false, "会话已过期，请重新登录");
+    }
+    let raw = f.chat_id.trim();
+    let Ok(cid) = raw.parse::<i64>() else {
+        return api_res(false, "chat_id 必须是整数（群 id 是负数，形如 -1001234567890）");
+    };
+    let mut known = crate::telegram_bot::known_chats(&state.pool).await;
+    if known.iter().any(|c| c == raw) {
+        return api_res(true, "该群已在列表中");
+    }
+    known.push(raw.to_string());
+    if let Err(e) = crate::qq_bot::set_cfg(&state.pool, "tg_known_chats", &known.join(",")).await {
+        return api_res(false, &format!("保存失败：{e}"));
+    }
+    audit(&state.pool, "telegram_chat_add", json!({"chat_id": cid})).await;
+    api_res(true, "已添加")
+}
+
+#[derive(Deserialize)]
+struct ApiTgChats {
+    #[serde(default)]
+    chats: Vec<String>,
+}
+
+/// 保存播报目标 chat 多选。逐个校验是否在已知列表内。
+async fn api_telegram_save_chats(
+    State(state): State<App>,
+    headers: HeaderMap,
+    Json(f): Json<ApiTgChats>,
+) -> Response {
+    if require_admin(&state, &headers).await.is_none() {
+        return api_res(false, "会话已过期，请重新登录");
+    }
+    let known = crate::telegram_bot::known_chats(&state.pool).await;
+    for c in &f.chats {
+        if !known.iter().any(|k| k == c) {
+            return api_res(false, "包含未知群，请刷新页面重试");
+        }
+        if c.parse::<i64>().is_err() {
+            return api_res(false, &format!("非法 chat_id：{c}"));
+        }
+    }
+    let joined = f.chats.join(",");
+    match crate::qq_bot::set_cfg(&state.pool, "tg_broadcast_chats", &joined).await {
+        Ok(()) => {
+            audit(&state.pool, "save_telegram_chats", json!({"chats": f.chats})).await;
+            if f.chats.is_empty() {
+                api_res(true, "已清空播报目标群（Telegram 播报关闭）")
+            } else {
+                api_res(true, "已保存播报目标群")
+            }
+        }
+        Err(e) => api_res(false, &format!("保存失败：{e}")),
+    }
 }
 
 #[derive(Deserialize)]
@@ -1972,6 +2210,10 @@ pub fn router() -> Router<App> {
         .route("/api/settings/password", post(api_change_password))
         .route("/api/settings/username", post(api_change_username))
         .route("/api/settings/bot", post(api_save_bot_config))
+        .route("/api/settings/telegram", post(api_save_telegram_config))
+        .route("/api/telegram/status", get(api_telegram_status))
+        .route("/api/telegram/chat-add", post(api_telegram_chat_add))
+        .route("/api/telegram/chats", post(api_telegram_save_chats))
         .route("/api/bot/rules", post(api_save_rules))
         .route("/api/bot/groups", get(api_known_groups))
         .route("/api/bot/groups", post(api_save_broadcast_groups))

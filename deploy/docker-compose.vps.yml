@@ -40,6 +40,18 @@ services:
       GARAGE_ENDPOINT: ${GARAGE_ENDPOINT:-http://garage:3900}
       GARAGE_KEY_ID: ${GARAGE_KEY_ID:-}
       GARAGE_SECRET: ${GARAGE_SECRET:-}
+      # Telegram API 出口代理。VPS 直连 api.telegram.org 会被 DNS 污染解析到
+      # Facebook 的 IP（实测 128.242.240.157 / 2a03:2880:f129:83:...），连接被拒。
+      # 值指向宿主机上的 mihomo（docker 网桥网关 172.25.0.1:7890）。
+      # 留空 = 直连（仅适用于境外机器）。
+      #
+      # ⚠️ NO_PROXY 不可省：reqwest 读的是**全局**代理环境变量，不区分目标。
+      # 不排除内网的话，发往 garage:3900 的头像请求也会被塞给 mihomo
+      # ⇒ 它不认识容器内网主机名 ⇒ 502 Bad Gateway ⇒ 头像上传 500
+      #（2026-11-03 实测踩到）。这里排除：容器内网主机名 + docker 网段 + 回环。
+      HTTPS_PROXY: ${TELEGRAM_PROXY:-}
+      HTTP_PROXY: ${TELEGRAM_PROXY:-}
+      NO_PROXY: garage,postgres,localhost,127.0.0.1,::1,172.16.0.0/12,10.0.0.0/8,192.168.0.0/16
     ports:
       - "127.0.0.1:8080:8080"
     depends_on:

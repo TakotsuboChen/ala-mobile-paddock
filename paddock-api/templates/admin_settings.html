@@ -14,6 +14,30 @@
   <button class="btn primary" style="margin-top:.8rem" onclick="brandSave()">保存品牌</button>
 </form>
 
+<h3 style="color:#8af;margin-top:2rem">Telegram 机器人</h3>
+<form id="tg-form" style="max-width:560px">
+  <label style="display:block;margin:.6rem 0 .2rem">Bot Token {% if tg_token_set %}<span style="color:#7c7">已设置</span>{% endif %}</label>
+  <input id="tg-token" type="password" autocomplete="new-password" placeholder="{% if tg_token_set %}••••••••{% else %}123456:ABC-DEF...（BotFather 发放）{% endif %}"
+         style="width:100%;box-sizing:border-box;padding:.5rem;border:1px solid #444;border-radius:8px;background:#2a2a2c;color:#eee">
+  <label style="display:block;margin:.6rem 0 .2rem">Webhook Secret {% if tg_secret_set %}<span style="color:#7c7">已设置</span>{% endif %}</label>
+  <input id="tg-secret" placeholder="{% if tg_secret_set %}留空 = 保持不变{% else %}留空 = 自动生成{% endif %}"
+         style="width:100%;box-sizing:border-box;padding:.5rem;border:1px solid #444;border-radius:8px;background:#2a2a2c;color:#eee">
+  <p style="color:#777;font-size:.85rem">webhook 回调地址：<span class="code">https://&lt;域名&gt;/tg/webhook</span>（保存 token 时自动调用 setWebhook 注册，结果显示在提示里）。</p>
+  <p style="color:#c96;font-size:.85rem">⚠️ <b>隐私模式</b>：Telegram bot 默认收不到群内全部消息。需在 BotFather <span class="code">/setprivacy</span> 关闭后<b>把机器人移出群再重新拉进来</b>（对已存在的群不立即生效），或直接<b>把机器人设为群管理员</b>（立即生效）。</p>
+  <button class="btn primary" onclick="tgSave()">保存并注册 webhook</button>
+  <button class="btn" onclick="tgCheck()" style="margin-left:.5rem">检查状态</button>
+</form>
+<div id="tg-status" style="color:#9ab;font-size:.85rem;margin-top:.6rem;max-width:640px;white-space:pre-wrap"></div>
+
+<h3 style="color:#8af;margin-top:2rem">Telegram 播报目标群</h3>
+<p style="color:#777;font-size:.85rem;max-width:640px">
+  Telegram 没有「查询我加入了哪些群」的接口，只能靠 bot 收到消息被动登记。<b>若列表为空</b>，请把群 chat_id（形如 <span class="code">-1001234567890</span>）手动填入下方输入框添加。
+</p>
+<input id="tg-chat-add" placeholder="-1001234567890" style="width:280px;padding:.5rem;border:1px solid #444;border-radius:8px;background:#2a2a2c;color:#eee">
+<button class="btn" onclick="tgChatAdd()">添加</button>
+<div id="tg-chat-list" style="display:flex;flex-direction:column;gap:.4rem;max-width:520px;margin:.6rem 0"></div>
+<button class="btn primary" onclick="tgChatsSave()">保存群选择</button>
+
 <h3 style="color:#8af;margin-top:2rem">QQ 机器人</h3>
 <form id="bot-form" style="max-width:560px">
   <label style="display:block;margin:.6rem 0 .2rem">AppID</label>
@@ -414,6 +438,61 @@ async function brandSave(){
   toast(msg, true);
   setTimeout(()=>location.reload(), 600);
 }
+// ---- telegram ----
+async function tgSave(){
+  const token = document.getElementById('tg-token').value;
+  const secret = document.getElementById('tg-secret').value;
+  const msg = await api('/admin/api/settings/telegram', {tg_bot_token: token, tg_webhook_secret: secret});
+  toast(msg, true);
+  document.getElementById('tg-status').textContent = msg;
+  setTimeout(()=>location.reload(), 1200);
+}
+async function tgCheck(){
+  const box = document.getElementById('tg-status');
+  box.textContent = '检查中…';
+  try {
+    const r = await fetch('/admin/api/telegram/status').then(x=>x.json());
+    box.textContent = r.message || JSON.stringify(r);
+  } catch(e) { box.textContent = '检查失败：' + e; }
+}
+// 已知群 + 已选群（服务端注入）
+let TG_KNOWN = {{ tg_known_chats_json | safe }};
+let TG_SELECTED = {{ tg_broadcast_chats_json | safe }};
+function tgRenderChats(){
+  const box = document.getElementById('tg-chat-list');
+  box.innerHTML = '';
+  if(TG_KNOWN.length === 0){
+    box.innerHTML = '<p style="color:#777;font-size:.85rem">尚无已知群——让机器人在群里收到一条消息，或用上方输入框手动添加 chat_id。</p>';
+    return;
+  }
+  TG_KNOWN.forEach(c=>{
+    const id = 'tgc-' + c.replace(/[^a-zA-Z0-9_-]/g,'_');
+    const row = document.createElement('label');
+    row.style.cssText = 'display:flex;gap:.5rem;align-items:center';
+    row.innerHTML = `<input type="checkbox" id="${id}" ${TG_SELECTED.includes(c)?'checked':''}>
+      <span class="code">${c}</span>`;
+    row.querySelector('input').addEventListener('change', ()=>{
+      const on = row.querySelector('input').checked;
+      TG_SELECTED = on ? [...new Set([...TG_SELECTED, c])] : TG_SELECTED.filter(x=>x!==c);
+    });
+    box.appendChild(row);
+  });
+}
+async function tgChatAdd(){
+  const v = document.getElementById('tg-chat-add').value.trim();
+  if(!v) return;
+  const msg = await api('/admin/api/telegram/chat-add', {chat_id: v});
+  toast(msg, true);
+  if(!TG_KNOWN.includes(v)) TG_KNOWN.push(v);
+  document.getElementById('tg-chat-add').value = '';
+  tgRenderChats();
+}
+async function tgChatsSave(){
+  const msg = await api('/admin/api/telegram/chats', {chats: TG_SELECTED});
+  toast(msg, true);
+}
+tgRenderChats();
+
 // ---- bot ----
 async function botSave(){
   const msg = await api('/admin/api/settings/bot', {

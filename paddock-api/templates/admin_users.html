@@ -5,12 +5,12 @@
   {% if !q.is_empty() %}<a href="/admin/users" style="color:#9ab;font-size:.85rem">清除</a>{% endif %}
 </form>
 <table id="user-table">
-<tr><th>车手 ID</th><th>用户名</th><th>member_openid</th><th>最好成绩数</th><th>注册日</th><th>操作</th></tr>
+<tr><th>车手 ID</th><th>用户名</th><th>平台 / 身份</th><th>最好成绩数</th><th>注册日</th><th>操作</th></tr>
 {% for u in users %}
 <tr data-id="{{ u.id }}" data-name="{{ u.username }}">
   <td class="code">{{ u.reg_seq }}</td>
   <td>{{ u.username }}</td>
-  <td class="code">{% if u.member_openid.is_empty() %}<i style="color:#777">未绑定</i>{% else %}{{ u.member_openid }}{% endif %}</td>
+  <td class="code">{% if !u.member_openid.is_empty() %}<span style="color:#8af">QQ</span> {{ u.member_openid }}{% else if !u.telegram_id.is_empty() %}<span style="color:#7cf">Telegram</span> {{ u.telegram_id }}{% else %}<i style="color:#777">未绑定</i>{% endif %}</td>
   <td>{{ u.best_count }}</td>
   <td>{{ u.created }}</td>
   <td>

@@ -6,10 +6,12 @@ mod admin;
 mod api;
 mod applog;
 mod auth;
+mod bot_core;
 mod qq_bot;
 mod runlog;
 /// 积分公式 + 辅助配置派生的单一事实源（见模块头注释：五处 SQL 副本的同步契约）。
 mod score;
+mod telegram_bot;
 /// 端到端 SQL 测试（`#[ignore]`，需 DATABASE_URL 指向真实 Postgres）。
 /// 只在 test 构建下编译——生产二进制不含测试代码。
 #[cfg(test)]
@@ -19,6 +21,10 @@ mod score_sql_tests;
 /// 类型匹配、半套调教归一化——这些编译期全都发现不了（sqlx 用的是运行时 query）。
 #[cfg(test)]
 mod car_setup_sql_tests;
+/// Telegram 建号 + 身份反查的端到端 SQL 测试（`#[ignore]`，需 DATABASE_URL）。
+/// 覆盖 0012 迁移：`telegram_id BIGINT` 的写入/唯一约束/52 位 id/两平台不串列。
+#[cfg(test)]
+mod telegram_sql_tests;
 mod state;
 
 use anyhow::Context;
@@ -57,16 +63,22 @@ async fn main() -> anyhow::Result<()> {
     applog::purge_expired(&pool).await; // 90 天保留：启动时清一次过期日志
     // 一次性：为库里已有的内置播报规则补 gold_template（新字段，旧 JSON 里没有）。
     // 用独立标记保证只跑一次——用户清空过金标模板后不会被静默填回。
-    qq_bot::migrate_gold_templates_once(&pool).await;
+    bot_core::migrate_gold_templates_once(&pool).await;
 
-    // bot 发送队列：凭据由管理端设置页动态配置，worker 出队时实时读取，无需重启
+    // bot 发送队列：凭据由管理端设置页动态配置，worker 出队时实时读取，无需重启。
+    // ⚠️ 两个平台**各自独立队列 + 独立 worker**（频控策略不同，见 state.rs 头注释）。
     let (bot_tx, bot_rx) = tokio::sync::mpsc::channel(64);
     qq_bot::run_sender(pool.clone(), bot_rx);
-    let app_state = state::AppState::new(pool).with_bot_tx(bot_tx);
+    let (tg_tx, tg_rx) = tokio::sync::mpsc::channel(64);
+    telegram_bot::run_sender(pool.clone(), tg_rx);
+    let app_state = state::AppState::new(pool)
+        .with_bot_tx(bot_tx)
+        .with_tg_tx(tg_tx);
     let app = Router::new()
         .nest("/v1", api::router())
         .nest("/admin", admin::router())
         .nest("/qq", qq_bot::router())
+        .nest("/tg", telegram_bot::router())
         .layer(TraceLayer::new_for_http())
         .with_state(app_state);
 
