@@ -31,6 +31,9 @@ sha2 = "0.10"
 hex = "0.4"
 hmac = "0.12"
 base64 = "0.22"
+# 只开需要的编解码器：默认特性会带进 avif/tiff/webp 等一大票依赖，
+# 二进制用 opt-level="z"+lto，体积代价必须控住。
+image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
 
 [profile.release]
 opt-level = "z"

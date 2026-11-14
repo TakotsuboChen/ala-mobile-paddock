@@ -188,10 +188,8 @@ pub async fn driver_page(
     // ── 资料卡 ──
     // best_count / zero_count / gold 与积分榜同口径：统计 best_laps 维度
     // （每人每赛道每版本一条）。`gold` 用总榜判据（2×零辅助 ≥ 总数 且 零辅助 > 0）。
-    let profile_row: Option<(String, i64, Option<String>, i64, i64)> = sqlx::query_as(
-        "SELECT u.username, u.reg_seq, \
-           CASE WHEN u.avatar_key IS NOT NULL \
-                THEN '/v1/avatar/'||u.id||'?v='||COALESCE(u.avatar_version,0) END, \
+    let profile_row: Option<(String, i64, Option<String>, i64, i64, i64)> = sqlx::query_as(
+        "SELECT u.username, u.reg_seq, u.avatar_key, u.avatar_version, \
            count(b.*)::bigint, \
            count(b.*) FILTER (WHERE b.tc_off AND b.abs_off)::bigint \
          FROM users u LEFT JOIN best_laps b ON b.user_id = u.id \
@@ -201,9 +199,15 @@ pub async fn driver_page(
     .bind(user_id)
     .fetch_optional(&state.pool)
     .await?;
-    let Some((username, reg_seq, avatar_url, best_count, zero_count)) = profile_row else {
+    let Some((username, reg_seq, avatar_key, avatar_version, best_count, zero_count)) = profile_row else {
         return Err(ApiError::not_found("车手不存在"));
     };
+    // 头像 URL 的唯一拼装点（OSS 已配置 → 绝对 URL，客户端直连）。
+    let oss_cfg = crate::oss::config_of(&state).await;
+    let migrated = crate::api::avatar::is_migrated(&state.pool).await;
+    let avatar_url = avatar_key
+        .as_deref()
+        .map(|k| crate::api::avatar::avatar_url(oss_cfg.as_ref(), migrated, user_id, k, avatar_version));
     // 总积分 + 总名次：与积分总榜同口径、同行号（单一实现点见 score.rs）。
     let (total_points, total_rank) = score::user_points_and_rank(&state.pool, user_id, None).await?;
 

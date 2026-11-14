@@ -51,7 +51,11 @@ services:
       #（2026-11-03 实测踩到）。这里排除：容器内网主机名 + docker 网段 + 回环。
       HTTPS_PROXY: ${TELEGRAM_PROXY:-}
       HTTP_PROXY: ${TELEGRAM_PROXY:-}
-      NO_PROXY: garage,postgres,localhost,127.0.0.1,::1,172.16.0.0/12,10.0.0.0/8,192.168.0.0/16
+      # 2026-11-14 追加 aliyuncs.com：OSS 是公网 HTTPS，经 mihomo 也能通，
+      # 但 VPS 在国内，直连阿里云比绕代理更快也更省代理额度。
+      # ⚠️ 只排除 aliyuncs.com（OSS/STS 域名），不要写 .aliyun.com 全域——
+      #    那会把 Telegram 的代理链无关服务也一并绕过。
+      NO_PROXY: garage,postgres,localhost,127.0.0.1,::1,172.16.0.0/12,10.0.0.0/8,192.168.0.0/16,aliyuncs.com
     ports:
       - "127.0.0.1:8080:8080"
     depends_on:

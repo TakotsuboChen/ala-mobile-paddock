@@ -340,22 +340,22 @@ pub async fn me(
     headers: axum::http::HeaderMap,
 ) -> Result<Json<MeResp>, ApiError> {
     let user_id = crate::api::laps::authenticate(&state, &headers).await?;
-    let row: Option<(String, i64, bool, Option<i64>)> = sqlx::query_as(
-        "SELECT username, reg_seq, (avatar_key IS NOT NULL), \
-         CASE WHEN avatar_key IS NOT NULL THEN COALESCE(avatar_version, 0) END \
-         FROM users WHERE id = $1",
+    let row: Option<(String, i64, Option<String>, i64)> = sqlx::query_as(
+        "SELECT username, reg_seq, avatar_key, avatar_version FROM users WHERE id = $1",
     )
     .bind(user_id)
     .fetch_optional(&state.pool)
     .await?;
-    let Some((username, reg_seq, has_avatar, avatar_version)) = row else {
+    let Some((username, reg_seq, avatar_key, avatar_version)) = row else {
         return Err(ApiError::unauthorized("账号不存在，请重新登录"));
     };
-    let avatar_url = if has_avatar {
-        Some(format!("/v1/avatar/{user_id}?v={}", avatar_version.unwrap_or(0)))
-    } else {
-        None
-    };
+    // 头像 URL 的唯一拼装点（OSS 已配置 → 绝对 URL，客户端直连对象存储）。
+    let oss_cfg = crate::oss::config_of(&state).await;
+    let migrated = crate::api::avatar::is_migrated(&state.pool).await;
+    let has_avatar = avatar_key.is_some();
+    let avatar_url = avatar_key
+        .as_deref()
+        .map(|k| crate::api::avatar::avatar_url(oss_cfg.as_ref(), migrated, user_id, k, avatar_version));
     // 积分口径与 leaderboard::points_board 总榜分支一致（版本=独立赛季累加 +
     // v40 线性基础分 + 2026-09-18 辅助加成）。**基础分与加成两段 SQL 都由
     // [`crate::score`] 生成**——本查询与榜单是两处独立实现，任何公式改动

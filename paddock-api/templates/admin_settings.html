@@ -72,6 +72,75 @@
   <p style="color:#777;font-size:.85rem">修改后需用新用户名重新登录。</p>
 </form>
 
+<h3 style="color:#8af;margin-top:2rem">对象存储（阿里云 OSS）</h3>
+<form id="oss-form" style="max-width:600px">
+  <p style="color:#777;font-size:.85rem;margin:0 0 .6rem">
+    配置后头像改为「客户端直连对象存储」：模块拿到 OSS 绝对 URL，图片字节不再经过本服务器。
+    所有字段均为必填，<b>AccessKey Secret 保存后不再回显</b>。未配置时系统继续用内置 Garage，行为不变。
+  </p>
+
+  <label style="display:block;margin:.6rem 0 .2rem">Endpoint（服务端访问用，只填域名）</label>
+  <input id="oss-endpoint" value="{{ oss_endpoint }}" placeholder="oss-cn-hangzhou.aliyuncs.com"
+         style="width:100%;box-sizing:border-box;padding:.5rem;border:1px solid #444;border-radius:8px;background:#2a2a2c;color:#eee">
+  <p style="color:#777;font-size:.8rem;margin:.2rem 0 0">
+    填公网域名任何情况都能用。<b>填内网域名（<span class="code">-internal</span> 后缀）只有 bucket 与 ECS
+    同地域时才能连上</b>——跨地域时内网域名无法解析。不确定就填公网域名。
+  </p>
+
+  <label style="display:block;margin:.6rem 0 .2rem">Bucket 名称</label>
+  <input id="oss-bucket" value="{{ oss_bucket }}" placeholder="paddock-avatars"
+         style="width:100%;box-sizing:border-box;padding:.5rem;border:1px solid #444;border-radius:8px;background:#2a2a2c;color:#eee">
+  <p style="color:#777;font-size:.8rem;margin:.2rem 0 0">只能含小写字母、数字和连字符（会进域名）。</p>
+
+  <label style="display:block;margin:.6rem 0 .2rem">地域（Region ID）</label>
+  <input id="oss-region" value="{{ oss_region }}" placeholder="cn-hangzhou"
+         style="width:100%;box-sizing:border-box;padding:.5rem;border:1px solid #444;border-radius:8px;background:#2a2a2c;color:#eee">
+  <p style="color:#777;font-size:.8rem;margin:.2rem 0 0">
+    形如 <span class="code">cn-hangzhou</span>，<b>必须与 bucket 实际所在地域一致</b>——填错会签名失败（403），不是「区域不支持」。
+  </p>
+
+  <label style="display:block;margin:.6rem 0 .2rem">AccessKey ID</label>
+  <input id="oss-key-id" value="{{ oss_key_id }}"
+         style="width:100%;box-sizing:border-box;padding:.5rem;border:1px solid #444;border-radius:8px;background:#2a2a2c;color:#eee">
+
+  <label style="display:block;margin:.6rem 0 .2rem">AccessKey Secret {% if oss_secret_set %}<span style="color:#7c7">已设置</span>{% endif %}</label>
+  <input id="oss-key-secret" type="password" autocomplete="new-password"
+         placeholder="{% if oss_secret_set %}••••••••（留空=保持不变）{% else %}必填{% endif %}"
+         style="width:100%;box-sizing:border-box;padding:.5rem;border:1px solid #444;border-radius:8px;background:#2a2a2c;color:#eee">
+
+  <label style="display:block;margin:.6rem 0 .2rem">客户端访问域名（下发给模块的 URL 前缀）</label>
+  <input id="oss-public-base" value="{{ oss_public_base }}" placeholder="https://paddock-avatars.oss-cn-hangzhou.aliyuncs.com"
+         style="width:100%;box-sizing:border-box;padding:.5rem;border:1px solid #444;border-radius:8px;background:#2a2a2c;color:#eee">
+  <p style="color:#777;font-size:.8rem;margin:.2rem 0 0">
+    必须含 <span class="code">https://</span>，且是<b>公网</b>域名（内网域名客户端连不上）。
+    留空则按 <span class="code">https://{bucket}.{endpoint}</span> 自动推导——只有服务端也走公网时才正确。
+  </p>
+
+  <div style="display:flex;gap:.6rem;margin-top:.9rem">
+    <button class="btn primary" type="button" onclick="ossSave()">保存配置</button>
+    <button class="btn" type="button" onclick="ossTest()">测试连接</button>
+  </div>
+  <div id="oss-status" style="white-space:pre-wrap;color:#9ab;font-size:.85rem;margin-top:.6rem"></div>
+</form>
+
+
+<h3 style="color:#8af;margin-top:2rem">存量头像迁移</h3>
+<div style="max-width:600px">
+  <p style="color:#777;font-size:.85rem;margin:0 0 .6rem">
+    把现有头像搬到对象存储并压缩到 256×256。<b>可重复执行</b>（已迁移的会自动跳过），
+    原图备份到 <span class="code">avatars_orig/</span>，保留 30 天可回滚。
+    迁移<b>不会</b>改动用户的换头像冷却，也<b>不会</b>让客户端重新下载头像。
+  </p>
+  <div style="display:flex;gap:.6rem;align-items:center">
+    <button class="btn primary" type="button" onclick="migStart()">开始迁移</button>
+    <span id="mig-summary" style="color:#9ab;font-size:.85rem"></span>
+  </div>
+  <div id="mig-bar" style="height:6px;background:#333;border-radius:3px;margin:.7rem 0;overflow:hidden;display:none">
+    <div id="mig-bar-fill" style="height:100%;width:0;background:#4a9;transition:width .3s"></div>
+  </div>
+  <pre id="mig-log" style="max-height:260px;overflow:auto;background:#1e1e20;border:1px solid #333;border-radius:8px;padding:.6rem;font-size:.8rem;color:#9ab;white-space:pre-wrap;margin:0"></pre>
+</div>
+
 <h3 style="color:#8af;margin-top:2rem">管理员密码</h3>
 <form id="pw-form" style="max-width:560px">
   <label style="display:block;margin:.6rem 0 .2rem">当前密码</label>
@@ -520,4 +589,96 @@ async function pwSave(){
   toast(msg+'，即将跳转登录', true);
   setTimeout(()=>location.href='/admin', 900);
 }
+// ⚠️ 公共 api() 的语义：**成功返回 message 字符串，失败抛 Error**。
+//    它不返回 {ok, message} 对象——曾误当对象用 r.ok，导致成功路径显示
+//    「失败：undefined」（2026-11-14 实机踩到，配置其实已经存进去了）。
+async function ossSave() {
+  const body = {
+    endpoint: document.getElementById('oss-endpoint').value.trim(),
+    bucket: document.getElementById('oss-bucket').value.trim(),
+    region: document.getElementById('oss-region').value.trim(),
+    key_id: document.getElementById('oss-key-id').value.trim(),
+    key_secret: document.getElementById('oss-key-secret').value,
+    public_base: document.getElementById('oss-public-base').value.trim(),
+  };
+  const el = document.getElementById('oss-status');
+  try {
+    const msg = await api('/admin/api/settings/oss', body);
+    el.textContent = msg;
+    toast(msg, true);
+    // secret 保存后不回显：清空输入框，避免用户误以为还要再填一次
+    document.getElementById('oss-key-secret').value = '';
+  } catch (e) {
+    el.textContent = '失败：' + e.message;
+    toast(e.message, false);
+  }
+}
+async function ossTest() {
+  const el = document.getElementById('oss-status');
+  el.textContent = '测试中…（写入 → 读回 → 删除 一个探针对象）';
+  try {
+    el.textContent = await api('/admin/api/settings/oss/test', {});
+  } catch (e) {
+    el.textContent = '失败：' + e.message;
+  }
+}
+let migTimer = null;
+function migRender(p) {
+  const done = p.done || 0, total = p.total || 0, failed = p.failed || 0, skipped = p.skipped || 0;
+  let s = `已处理 ${done} / ${total}`;
+  if (skipped) s += `，跳过 ${skipped}`;
+  if (failed) s += `，失败 ${failed}`;
+  if (p.running) s += '（进行中…）';
+  else if (p.finished_at) s += '（已结束）';
+  if (p.error) s += ' · 错误：' + p.error;
+  document.getElementById('mig-summary').textContent = s;
+
+  const bar = document.getElementById('mig-bar');
+  const fill = document.getElementById('mig-bar-fill');
+  if (p.running || total > 0) {
+    bar.style.display = 'block';
+    fill.style.width = (total ? Math.min(100, (done + skipped + failed) / total * 100) : 0) + '%';
+  }
+}
+async function migPoll() {
+  // ⚠️ 这里必须自己取 DOM：早期版本误用了 ossTest 里的局部变量 `el`，
+  //    每轮都抛 ReferenceError 被 catch 吞掉 ⇒ 表现为「点了迁移完全没反应」
+  //    （2026-11-14 实测踩到）。轮询函数一律自取元素，不依赖外部作用域。
+  const logEl = document.getElementById('mig-log');
+  if (!logEl) return;  // 页面已切走/刷新：静默退出即可
+  try {
+    // 公共 api() 是 POST-only 且只回 message 字符串，这里需要完整 JSON。
+    const resp = await fetch('/admin/api/settings/oss/migrate?after=0');
+    if (!resp.ok) throw new Error('HTTP ' + resp.status);
+    const r = await resp.json();
+    logEl.textContent = (r.lines || []).join('\n');
+    logEl.scrollTop = logEl.scrollHeight;
+    migRender(r.progress || {});
+    if (r.progress && !r.progress.running && migTimer) {
+      clearInterval(migTimer);
+      migTimer = null;
+    }
+  } catch (e) {
+    // ⚠️ 只有网络类错误静默重试；编程错误必须露出（否则永远查不出问题）。
+    if (e instanceof ReferenceError || e instanceof TypeError) {
+      console.error('[migPoll] 代码错误:', e);
+      if (migTimer) { clearInterval(migTimer); migTimer = null; }
+      document.getElementById('mig-summary').textContent = '轮询出错：' + e.message + '（详见控制台）';
+    }
+  }
+}
+async function migStart() {
+  const ok = confirm('确定开始迁移？\n\n这会读取全部现有头像、压缩后写入对象存储。过程可重复执行，中断后重新点击即可续跑。');
+  if (!ok) return;
+  try {
+    const msg = await api('/admin/api/settings/oss/migrate', {});
+    toast(msg, true);
+    if (migTimer) clearInterval(migTimer);
+    migTimer = setInterval(migPoll, 1500);
+    migPoll();
+  } catch (e) {
+    toast(e.message, false);
+  }
+}
+
 </script>

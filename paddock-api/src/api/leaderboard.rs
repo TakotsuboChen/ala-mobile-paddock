@@ -120,8 +120,7 @@ pub async fn points_board(
         "{scored}, \
          agg AS ( \
            SELECT u.id AS user_id, u.reg_seq AS reg_seq, u.username AS username, \
-                  (CASE WHEN u.avatar_key IS NOT NULL \
-                        THEN '/v1/avatar/'||u.id||'?v='||COALESCE(u.avatar_version,0) END) AS avatar_url, \
+                  u.avatar_key AS avatar_key, u.avatar_version AS avatar_version, \
                   sum(s.base_pts + {bonus})::bigint AS points, \
                   count(*)::bigint AS best_count, \
                   count(*) FILTER (WHERE s.tc_off AND s.abs_off)::bigint AS zero_count, \
@@ -142,7 +141,8 @@ pub async fn points_board(
         user_id: Uuid,
         reg_seq: i64,
         username: String,
-        avatar_url: Option<String>,
+        avatar_key: Option<String>,
+        avatar_version: i64,
         points: i64,
         best_count: i64,
         zero_count: i64,
@@ -156,13 +156,22 @@ pub async fn points_board(
     q = q.bind(limit).bind(offset);
     let rows = q.fetch_all(&state.pool).await?;
     let total = rows.first().map(|r| r.total).unwrap_or(0);
+    // 头像 URL 的唯一拼装点（绝对 URL 还是相对路径由 OSS 是否配置决定）。
+    let oss_cfg = crate::oss::config_of(&state).await;
+    let migrated = crate::api::avatar::is_migrated(&state.pool).await;
     let entries = rows
         .into_iter()
         .map(|r| PointsEntry {
             user_id: r.user_id,
             reg_seq: r.reg_seq,
             username: r.username,
-            avatar_url: r.avatar_url,
+            avatar_url: r
+                .avatar_key
+                .as_deref()
+                .map(|k| {
+                    crate::api::avatar::avatar_url(
+                        oss_cfg.as_ref(), migrated, r.user_id, k, r.avatar_version)
+                }),
             points: r.points,
             best_count: r.best_count,
             zero_count: r.zero_count,
@@ -216,8 +225,8 @@ pub async fn track_board(
     // 两分支都取"该用户在该赛道的最佳圈"及其配置：显式版本按版本过滤；
     // 无版本 = 跨版本 best of best（DISTINCT ON 取最快那条，与 min() 语义等价
     // 但能同时带回该圈的配置列）。外层再按圈速排序定名次。
-    let avatar = "(CASE WHEN u.avatar_key IS NOT NULL \
-                  THEN '/v1/avatar/'||u.id||'?v='||COALESCE(u.avatar_version,0) END)";
+    // 只取 key，URL 由 Rust 侧 [`crate::api::avatar::avatar_url`] 统一拼装。
+    let avatar = "u.avatar_key, u.avatar_version";
     let inner_where = match f.version {
         Some(_) => "b.gp_index=$1 AND b.version_code=$2",
         None => "b.gp_index=$1",
@@ -232,12 +241,13 @@ pub async fn track_board(
     let offset_ph = if f.version.is_some() { 4 } else { 3 };
     let sql = format!(
         "WITH ranked AS ( \
-           SELECT user_id, reg_seq, username, avatar_url, lap_ms, \
+           SELECT user_id, reg_seq, username, avatar_key, avatar_version, lap_ms, \
                   (tc_off AND abs_off) AS gold, \
                   row_number() OVER (ORDER BY lap_ms ASC)::bigint AS \"rank\", \
                   count(*) OVER ()::bigint AS total \
            FROM ( \
-             SELECT DISTINCT ON (b.user_id) b.user_id, u.reg_seq, u.username, {avatar} AS avatar_url, \
+             SELECT DISTINCT ON (b.user_id) b.user_id, u.reg_seq, u.username, \
+                    u.avatar_key AS avatar_key, u.avatar_version AS avatar_version, \
                     b.lap_ms, b.tc_off, b.abs_off \
              FROM best_laps b JOIN users u ON u.id = b.user_id \
              WHERE {inner_where} \
@@ -251,7 +261,8 @@ pub async fn track_board(
         user_id: Uuid,
         reg_seq: i64,
         username: String,
-        avatar_url: Option<String>,
+        avatar_key: Option<String>,
+        avatar_version: i64,
         lap_ms: i32,
         gold: bool,
         #[sqlx(rename = "rank")]
@@ -267,6 +278,8 @@ pub async fn track_board(
     let rows = q.fetch_all(&state.pool).await?;
     let total = rows.first().map(|r| r.total).unwrap_or(0);
 
+    let oss_cfg = crate::oss::config_of(&state).await;
+    let migrated = crate::api::avatar::is_migrated(&state.pool).await;
     let entries = rows
         .into_iter()
         .map(|r| TrackEntry {
@@ -274,7 +287,13 @@ pub async fn track_board(
             user_id: r.user_id,
             reg_seq: r.reg_seq,
             username: r.username,
-            avatar_url: r.avatar_url,
+            avatar_url: r
+                .avatar_key
+                .as_deref()
+                .map(|k| {
+                    crate::api::avatar::avatar_url(
+                        oss_cfg.as_ref(), migrated, r.user_id, k, r.avatar_version)
+                }),
             lap_ms: r.lap_ms,
             lap_display: format_lap_ms(r.lap_ms),
             gold: r.gold,

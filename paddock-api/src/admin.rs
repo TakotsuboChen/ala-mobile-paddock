@@ -1505,6 +1505,13 @@ struct SettingsTemplate {
     /// 内置动作元数据 JSON（前端渲染动作下拉/失败字段/默认文案的唯一事实源，
     /// 替代此前 JS 里的 ACTIONS/FAIL_FIELDS/PRESET_FAIL 三份硬编码镜像）。
     actions_json: String,
+    /// 对象存储配置回显（secret 只回显「已设置」）
+    oss_endpoint: String,
+    oss_bucket: String,
+    oss_region: String,
+    oss_key_id: String,
+    oss_public_base: String,
+    oss_secret_set: bool,
 }
 
 async fn settings_page(State(state): State<App>, headers: HeaderMap) -> Response {
@@ -1547,6 +1554,15 @@ async fn render_settings(state: &App) -> Response {
     let tg_known_list = crate::telegram_bot::known_chats(&state.pool).await;
     let rules_json = crate::qq_bot::load_rules_json(&state.pool).await;
     let (dash_title, dash_logo) = brand(&state.pool).await;
+    let oss_endpoint = crate::qq_bot::get_cfg(&state.pool, crate::oss::keys::ENDPOINT).await.unwrap_or_default();
+    let oss_bucket = crate::qq_bot::get_cfg(&state.pool, crate::oss::keys::BUCKET).await.unwrap_or_default();
+    let oss_region = crate::qq_bot::get_cfg(&state.pool, crate::oss::keys::REGION).await.unwrap_or_default();
+    let oss_key_id = crate::qq_bot::get_cfg(&state.pool, crate::oss::keys::KEY_ID).await.unwrap_or_default();
+    let oss_public_base = crate::qq_bot::get_cfg(&state.pool, crate::oss::keys::PUBLIC_BASE).await.unwrap_or_default();
+    let oss_secret_set = crate::qq_bot::get_cfg(&state.pool, crate::oss::keys::SECRET)
+        .await
+        .map(|s| !s.trim().is_empty())
+        .unwrap_or(false);
     let body = SettingsTemplate {
         favicon_href: favicon_href(&dash_logo),
         site_logo_src: dash_logo.clone().unwrap_or_else(|| DEFAULT_FAVICON.to_string()),
@@ -1560,6 +1576,12 @@ async fn render_settings(state: &App) -> Response {
         rules_json,
         actions_json: serde_json::to_string(&crate::qq_bot::action_metas())
             .unwrap_or_else(|_| "[]".into()),
+        oss_endpoint,
+        oss_bucket,
+        oss_region,
+        oss_key_id,
+        oss_public_base,
+        oss_secret_set,
     }
     .render()
     .unwrap();
@@ -1624,6 +1646,165 @@ async fn api_change_password(
         .ok();
     audit(&state.pool, "change_admin_password", json!({})).await;
     api_res(true, "密码已修改，请重新登录")
+}
+
+// ---------- 对象存储（OSS）配置 + 迁移 ----------
+
+#[derive(Deserialize)]
+struct ApiSaveOss {
+    endpoint: String,
+    bucket: String,
+    region: String,
+    key_id: String,
+    /// 留空 = 保留原值（与 bot secret / TG token 同一套脱敏约定）
+    key_secret: String,
+    public_base: String,
+}
+
+/// POST /admin/api/settings/oss：保存 OSS 配置。
+///
+/// `key_secret` 留空 = 不修改（前端只回显「已设置」，绝不回显值）。
+async fn api_save_oss(
+    State(state): State<App>,
+    headers: HeaderMap,
+    Json(f): Json<ApiSaveOss>,
+) -> Response {
+    if require_admin(&state, &headers).await.is_none() {
+        return api_res(false, "会话已过期，请重新登录");
+    }
+    let endpoint = f.endpoint.trim();
+    let bucket = f.bucket.trim();
+    let region = f.region.trim();
+    let key_id = f.key_id.trim();
+    let public_base = f.public_base.trim();
+
+    if endpoint.is_empty() || bucket.is_empty() || region.is_empty() || key_id.is_empty() {
+        return api_res(false, "Endpoint / Bucket / 地域 / AccessKey ID 均为必填");
+    }
+    // bucket 名会进 DNS 主机名（virtual-hosted style），下划线与大写会让域名非法。
+    if !bucket
+        .chars()
+        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+    {
+        return api_res(false, "Bucket 名只能含小写字母、数字和连字符");
+    }
+
+    let secret = if f.key_secret.trim().is_empty() {
+        match crate::qq_bot::get_cfg(&state.pool, crate::oss::keys::SECRET).await {
+            Some(s) if !s.trim().is_empty() => s,
+            _ => return api_res(false, "首次配置必须填写 AccessKey Secret"),
+        }
+    } else {
+        f.key_secret.trim().to_string()
+    };
+
+    for (k, v) in [
+        (crate::oss::keys::ENDPOINT, endpoint),
+        (crate::oss::keys::BUCKET, bucket),
+        (crate::oss::keys::REGION, region),
+        (crate::oss::keys::KEY_ID, key_id),
+        (crate::oss::keys::PUBLIC_BASE, public_base),
+    ] {
+        if let Err(e) = crate::qq_bot::set_cfg(&state.pool, k, v).await {
+            return api_res(false, &format!("保存失败: {e}"));
+        }
+    }
+    if let Err(e) = crate::qq_bot::set_cfg(&state.pool, crate::oss::keys::SECRET, &secret).await {
+        return api_res(false, &format!("保存失败: {e}"));
+    }
+    audit(
+        &state.pool,
+        "save_oss_config",
+        json!({ "bucket": bucket, "region": region }),
+    )
+    .await;
+    api_res(true, "已保存。点「测试连接」验证签名与网络是否正常。")
+}
+
+/// POST /admin/api/settings/oss/migrate：启动存量头像迁移（后台任务）。
+async fn api_start_migrate(State(state): State<App>, headers: HeaderMap) -> Response {
+    if require_admin(&state, &headers).await.is_none() {
+        return api_res(false, "会话已过期，请重新登录");
+    }
+    match crate::avatar_migrate::start(state.clone()) {
+        Ok(()) => {
+            audit(&state.pool, "start_avatar_migrate", json!({})).await;
+            api_res(true, "迁移已开始，可在下方查看进度")
+        }
+        Err(e) => api_res(false, &e),
+    }
+}
+
+/// GET /admin/api/settings/oss/migrate?after=<seq>：增量进度 + 日志。
+async fn api_migrate_progress(State(state): State<App>, headers: HeaderMap) -> Response {
+    if require_admin(&state, &headers).await.is_none() {
+        return api_res(false, "会话已过期，请重新登录");
+    }
+    let _ = state;
+    let (lines, seq, p) = crate::avatar_migrate::read_after(0);
+    Json(json!({
+        "ok": true,
+        "message": "",
+        "lines": lines,
+        "last": seq,
+        "progress": p,
+    }))
+    .into_response()
+}
+
+/// GET /admin/api/settings/oss/migrate/snapshot：只取进度（轮询用，不带日志）。
+async fn api_migrate_snapshot(State(state): State<App>, headers: HeaderMap) -> Response {
+    if require_admin(&state, &headers).await.is_none() {
+        return api_res(false, "会话已过期，请重新登录");
+    }
+    let _ = state;
+    Json(json!({ "ok": true, "message": "", "progress": crate::avatar_migrate::snapshot() }))
+        .into_response()
+}
+
+/// POST /admin/api/settings/oss/test：连通性自检（写→读→删一个探针对象）。
+///
+/// 分步返回失败原因：签名错（403 SignatureDoesNotMatch）、地域填错（同样 403 但
+/// 日志不同）、网络不通（连接超时）是完全不同的修复方向，混成「连接失败」等于没测。
+async fn api_test_oss(State(state): State<App>, headers: HeaderMap) -> Response {
+    if require_admin(&state, &headers).await.is_none() {
+        return api_res(false, "会话已过期，请重新登录");
+    }
+    let Some(cfg) = crate::oss::config_of(&state).await else {
+        return api_res(false, "尚未配置 OSS（先保存配置再测试）");
+    };
+    match crate::oss::self_check(&cfg).await {
+        Ok(msg) => api_res(true, &msg),
+        Err(e) => api_res(false, &e),
+    }
+}
+
+/// GET /admin/api/settings/oss：读取当前配置（secret 只回显是否已设置）。
+async fn api_get_oss(State(state): State<App>, headers: HeaderMap) -> Response {
+    if require_admin(&state, &headers).await.is_none() {
+        return api_res(false, "会话已过期，请重新登录");
+    }
+    let pool = &state.pool;
+    let endpoint = crate::qq_bot::get_cfg(pool, crate::oss::keys::ENDPOINT).await.unwrap_or_default();
+    let bucket = crate::qq_bot::get_cfg(pool, crate::oss::keys::BUCKET).await.unwrap_or_default();
+    let region = crate::qq_bot::get_cfg(pool, crate::oss::keys::REGION).await.unwrap_or_default();
+    let key_id = crate::qq_bot::get_cfg(pool, crate::oss::keys::KEY_ID).await.unwrap_or_default();
+    let public_base = crate::qq_bot::get_cfg(pool, crate::oss::keys::PUBLIC_BASE).await.unwrap_or_default();
+    let secret_set = crate::qq_bot::get_cfg(pool, crate::oss::keys::SECRET)
+        .await
+        .map(|s| !s.trim().is_empty())
+        .unwrap_or(false);
+    Json(json!({
+        "ok": true,
+        "message": "",
+        "endpoint": endpoint,
+        "bucket": bucket,
+        "region": region,
+        "key_id": key_id,
+        "public_base": public_base,
+        "secret_set": secret_set,
+    }))
+    .into_response()
 }
 
 #[derive(Deserialize)]
@@ -2163,6 +2344,12 @@ fn action_message(action: &str, detail: &serde_json::Value) -> String {
         "save_bot_rules" => format!("保存消息规则（{} 条）", detail["count"]),
         "save_broadcast_groups" => format!("保存播报目标群（{} 个）", detail["count"]),
         "save_brand" => format!("保存品牌配置（站点名：{}）", detail["site_title"].as_str().unwrap_or("")),
+        "start_avatar_migrate" => "启动存量头像迁移".into(),
+        "save_oss_config" => format!(
+            "保存对象存储配置（bucket={}, 地域={}）",
+            detail["bucket"].as_str().unwrap_or(""),
+            detail["region"].as_str().unwrap_or("")
+        ),
         other => other.to_string(),
     }
 }
@@ -2219,6 +2406,13 @@ pub fn router() -> Router<App> {
         .route("/api/bot/groups", post(api_save_broadcast_groups))
         .route("/api/bot/group-name", post(api_save_group_name))
         .route("/api/runtime-logs", get(api_runtime_logs))
+        // 对象存储
+        .route("/api/settings/oss", get(api_get_oss))
+        .route("/api/settings/oss", post(api_save_oss))
+        .route("/api/settings/oss/test", post(api_test_oss))
+        .route("/api/settings/oss/migrate", post(api_start_migrate))
+        .route("/api/settings/oss/migrate", get(api_migrate_progress))
+        .route("/api/settings/oss/migrate/snapshot", get(api_migrate_snapshot))
         .route("/api/brand", post(api_save_brand))
 }
 

@@ -6,7 +6,11 @@ mod admin;
 mod api;
 mod applog;
 mod auth;
+/// 存量头像迁移（DB 驱动 → 压缩 → 写 OSS）。
+mod avatar_migrate;
 mod bot_core;
+/// 阿里云 OSS 客户端（V4 签名手写实现）。头像读写与迁移都走这里。
+mod oss;
 mod qq_bot;
 mod runlog;
 /// 积分公式 + 辅助配置派生的单一事实源（见模块头注释：五处 SQL 副本的同步契约）。
